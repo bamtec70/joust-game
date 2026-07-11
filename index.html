@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#1a0a00" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <title>JOUST — Williams 1982</title>
+  <link rel="stylesheet" href="joust-v1.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div id="game-wrapper">
+    <div id="canvas-wrap">
+      <canvas id="game" width="1920" height="1080"></canvas>
+      <div id="hud">
+        <div class="hud-block">
+          <div class="label">1UP</div>
+          <div id="score">00</div>
+        </div>
+        <div class="hud-block">
+          <div class="label">HIGH</div>
+          <div id="high-score">00</div>
+        </div>
+        <div class="hud-block">
+          <div class="label">WAVE</div>
+          <div id="wave">1</div>
+        </div>
+        <div class="hud-block">
+          <div class="label">LIVES</div>
+          <div id="lives">▲▲▲</div>
+        </div>
+      </div>
+      <div id="overlay">
+        <div id="overlay-title">JOUST</div>
+        <div id="overlay-sub">INSERT COIN</div>
+        <div id="overlay-hint">PRESS SPACE / FLAP OR TAP TO START</div>
+        <div id="overlay-controls">
+          ← → / A D — FACE · SPACE / FLAP — WING FLAP<br />
+          HIT ENEMIES FROM ABOVE · COLLECT EGGS<br />
+          AVOID LAVA &amp; THE PTERODACTYL · M MUTE
+        </div>
+      </div>
+    </div>
+
+    <div id="mobile-controls" aria-label="Touch controls">
+      <div class="mobile-col">
+        <button type="button" id="btn-left" class="mobile-btn" aria-label="Left">◀</button>
+        <button type="button" id="btn-right" class="mobile-btn" aria-label="Right">▶</button>
+      </div>
+      <div class="mobile-col mid">
+        <button type="button" id="btn-flap" class="mobile-btn flap" aria-label="Flap">FLAP</button>
+      </div>
+      <div class="mobile-col side">
+        <button type="button" id="btn-pause" class="mobile-btn small" aria-label="Pause">❚❚</button>
+        <button type="button" id="btn-mute" class="mobile-btn small" aria-label="Mute">♪</button>
+      </div>
+    </div>
+  </div>
+  <script src="joust-v1.js"></script>
+</body>
+</html>
