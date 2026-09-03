@@ -12,10 +12,11 @@ Browser recreation of **Williams Electronics’ Joust** (1982), companion to:
 
 **Live:** https://bamtec70.github.io/joust-game/
 
-Local:
+You should see **BUILD V11** on the title screen. If nobody is playing, the cabinet runs an **attract demo**, then loops back to INSERT COIN. Space, flap, or tap starts a real game.
 
 ```powershell
-start index.html
+cd C:\Users\bamte\joust
+python -m http.server 8766
 ```
 
 **Landscape / horizontal** playfield fills the screen. Rotate phones sideways for best play.
@@ -49,6 +50,7 @@ Extra mount every **20,000**.
 
 ## Files
 
-- `index.html` / `joust-v1.css` / `joust-v1.js`
+- `index.html` / `joust-v11.css` / `joust-v11.js`
+- `sfx/` — original Williams cabinet samples (16-bit PCM for the browser)
 
 Fan recreation for personal / educational use. Not affiliated with Williams or its successors.
