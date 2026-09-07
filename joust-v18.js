@@ -1,0 +1,2947 @@
+/**
+ * JOUST — Williams Electronics 1982 (Build V18)
+ * V18: exact 3× arcade (876×720) cliff board from playfield ref. Sprites = V16, egg physics = V15.
+ * Landscape flap combat, eggs, pterodactyl, lava troll.
+ */
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) return;
+
+  // Exact 3× Williams arcade playfield (292×240 → 876×720)
+  const VW = 876; // 292*3
+  const VH = 720; // 240*3
+  const DPR = Math.min(window.devicePixelRatio || 1, 3);
+  // ~3× backing store → crisp anti-aliased vectors on retina / large screens
+  const SCALE = 3 * (DPR >= 2 ? 1.1 : 1);
+  canvas.width = Math.round(VW * SCALE);
+  canvas.height = Math.round(VH * SCALE);
+  ctx.imageSmoothingEnabled = true;
+  try {
+    ctx.imageSmoothingQuality = "high";
+  } catch (_) {}
+
+  const overlay = document.getElementById("overlay");
+  const $title = document.getElementById("overlay-title");
+  const $sub = document.getElementById("overlay-sub");
+  const $hint = document.getElementById("overlay-hint");
+  const $score = document.getElementById("score");
+  const $high = document.getElementById("high-score");
+  const $wave = document.getElementById("wave");
+  const $lives = document.getElementById("lives");
+
+  // ── Colors closer to Williams 16-color Joust feel ────────────────────────
+  const C = {
+    black: "#000000",
+    sky: "#000000",
+    skyGlow: "#1a0c18",
+    rock: "#b85a28",
+    rockMid: "#8a4020",
+    rockDk: "#5a2810",
+    rockLt: "#d87840",
+    rockRim: "#f0a060",
+    lava: "#e03000",
+    lavaHot: "#ff9000",
+    lavaCore: "#ffe060",
+    yellow: "#ffff40",
+    // Bird BODY colors (Williams attract) — rider armor is separate in drawRider
+    player: "#c88848", // tan/brown ostrich body
+    playerDk: "#8a5828",
+    playerWing: "#d8a060",
+    playerNeck: "#f4f0e8", // pale/white neck
+    playerRider: "#f0d020", // yellow rider/helmet
+    playerRiderDk: "#b89010",
+    white: "#f0f0f0",
+    bounder: "#38a838", // GREEN bird body
+    bounderDk: "#186818",
+    bounderWing: "#58c848",
+    bounderRider: "#e03830", // RED rider/helmet
+    bounderRiderDk: "#901810",
+    hunter: "#b0b0b8", // gray/silver bird
+    hunterDk: "#585868",
+    hunterWing: "#d0d0d8",
+    hunterRider: "#c8c8d0", // gray rider OK
+    hunterRiderDk: "#686878",
+    shadow: "#2838a0", // dark blue bird
+    shadowDk: "#141860",
+    shadowWing: "#4050c0",
+    shadowRider: "#4860e0", // blue rider
+    shadowRiderDk: "#2030a0",
+    egg: "#48c848",
+    ptero: "#c09070",
+    pteroWing: "#a07050",
+    hand: "#e06040",
+    knight: "#e8e8e8",
+    lance: "#e8ecf4",
+  };
+
+  // ── Audio — original Williams cabinet DAC samples (not 2600 beeps)
+  let AC = null, master = null, dacWave = null, noiseBuf = null;
+  let muted = false;
+  let lastTrot = 0;
+  let sfxBuf = Object.create(null);
+  let sfxLoading = false;
+  let musicLockUntil = 0;
+  let audioUnlocking = null;
+  const SFX_URLS = {
+    flap: "sfx/joust-flap-16.wav",
+    egg: "sfx/joust-egg-16.wav",
+    lava: "sfx/joust-lava-16.wav",
+    ptero: "sfx/joust-pterodactyl-cry-16.wav",
+    start: "sfx/joust-start-snd-16.wav",
+    thunk: "sfx/joust-thunk-16.wav",
+    freeman: "sfx/joust-freeman-16.wav",
+  };
+
+  function dest() {
+    return master || (AC && AC.destination);
+  }
+
+  function loadSfx() {
+    if (sfxLoading || !AC) return;
+    sfxLoading = true;
+    Object.keys(SFX_URLS).forEach((key) => {
+      fetch(SFX_URLS[key])
+        .then((r) => r.arrayBuffer())
+        .then((ab) => AC.decodeAudioData(ab.slice(0)))
+        .then((buf) => {
+          sfxBuf[key] = buf;
+        })
+        .catch(() => {});
+    });
+  }
+
+  function playSample(key, vol, rate) {
+    const buf = sfxBuf[key];
+    if (!buf || !AC) return false;
+    try {
+      const src = AC.createBufferSource();
+      src.buffer = buf;
+      src.playbackRate.value = rate || 1;
+      const g = AC.createGain();
+      g.gain.value = vol == null ? 0.9 : vol;
+      src.connect(g);
+      g.connect(dest());
+      src.start();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function lockMusic(sec) {
+    if (!AC) return;
+    musicLockUntil = Math.max(musicLockUntil, AC.currentTime + sec);
+  }
+  function musicLocked() {
+    return !!(AC && AC.currentTime < musicLockUntil);
+  }
+
+  async function unlockAudio() {
+    try {
+      if (!AC) {
+        AC = new (window.AudioContext || window.webkitAudioContext)();
+        master = AC.createGain();
+        master.gain.value = 0.85;
+        master.connect(AC.destination);
+        const n = 32;
+        const real = new Float32Array(n);
+        const imag = new Float32Array(n);
+        for (let i = 1; i < n; i++) {
+          imag[i] = (1 / Math.pow(i, 0.85)) * (i % 4 === 0 ? 0.35 : 1) * Math.sin(i * 0.55);
+        }
+        try {
+          dacWave = AC.createPeriodicWave(real, imag);
+        } catch (_) {
+          dacWave = null;
+        }
+        const len = Math.floor(AC.sampleRate * 0.4);
+        noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+        const d = noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+        loadSfx();
+      }
+      if (AC.state === "suspended") {
+        if (!audioUnlocking) {
+          audioUnlocking = AC.resume().finally(() => {
+            audioUnlocking = null;
+          });
+        }
+        try {
+          await audioUnlocking;
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  function tone(freq, dur, type = "triangle", vol = 0.04, when = 0, slideTo) {
+    if (muted || !AC) return;
+    try {
+      const t0 = AC.currentTime + when;
+      const o = AC.createOscillator();
+      const g = AC.createGain();
+      if (type === "dac" && dacWave) o.setPeriodicWave(dacWave);
+      else o.type = type === "dac" ? "sawtooth" : type;
+      o.frequency.setValueAtTime(Math.max(20, freq), t0);
+      if (slideTo != null) {
+        o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + dur);
+      }
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(vol, t0 + 0.004);
+      g.gain.exponentialRampToValueAtTime(vol * 0.45, t0 + Math.min(0.04, dur * 0.35));
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g);
+      g.connect(dest());
+      o.start(t0);
+      o.stop(t0 + dur + 0.03);
+    } catch (_) {}
+  }
+
+  function noise(dur, vol = 0.05, when = 0, ff = 800, fTo) {
+    if (muted || !AC || !noiseBuf) return;
+    try {
+      const t0 = AC.currentTime + when;
+      const src = AC.createBufferSource();
+      src.buffer = noiseBuf;
+      src.loop = true;
+      const f = AC.createBiquadFilter();
+      f.type = "bandpass";
+      f.Q.value = 1.8;
+      f.frequency.setValueAtTime(ff, t0);
+      if (fTo != null) f.frequency.exponentialRampToValueAtTime(Math.max(40, fTo), t0 + dur);
+      const g = AC.createGain();
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      src.connect(f);
+      f.connect(g);
+      g.connect(dest());
+      src.start(t0);
+      src.stop(t0 + dur + 0.02);
+    } catch (_) {}
+  }
+
+  function sfx(name) {
+    unlockAudio();
+    if (muted || !AC) return;
+    // Keep start sting clear — don't let wave/extra stomp it
+    if (musicLocked() && (name === "wave" || name === "extra" || name === "ptero")) return;
+    if (name === "flap") {
+      if (playSample("flap", 1, 1)) {
+        tone(180, 0.05, "triangle", 0.012, 0, 70);
+        return;
+      }
+      noise(0.07, 0.055, 0, 1100, 220);
+      tone(165, 0.075, "dac", 0.038, 0, 62);
+    } else if (name === "trot") {
+      const now = AC.currentTime;
+      if (now - lastTrot < 0.12) return;
+      lastTrot = now;
+      if (playSample("thunk", 0.28, 1.55)) return;
+      noise(0.035, 0.03, 0, 900, 400);
+    } else if (name === "kill") {
+      if (playSample("thunk", 1, 1)) {
+        tone(280, 0.08, "dac", 0.018, 0, 90);
+        return;
+      }
+      noise(0.14, 0.07, 0, 700, 180);
+      tone(320, 0.16, "dac", 0.045, 0, 70);
+    } else if (name === "die") {
+      playSample("thunk", 0.9, 0.85);
+      if (playSample("lava", 0.75, 1.05)) return;
+      noise(0.45, 0.08, 0, 500, 80);
+      tone(240, 0.5, "dac", 0.05, 0, 38);
+    } else if (name === "egg") {
+      if (playSample("egg", 1, 1)) {
+        tone(640, 0.05, "triangle", 0.016, 0, 900);
+        return;
+      }
+      tone(520, 0.07, "dac", 0.04, 0, 780);
+    } else if (name === "hatch") {
+      if (playSample("egg", 0.85, 0.72)) return;
+      noise(0.12, 0.05, 0, 1800, 500);
+    } else if (name === "wave") {
+      if (playSample("freeman", 0.9, 1)) {
+        [160, 220].forEach((f, i) => tone(f, 0.1, "triangle", 0.012, i * 0.08, f * 1.2));
+        return;
+      }
+      [140, 190, 250, 330, 410].forEach((f, i) => tone(f, 0.16, "dac", 0.036, i * 0.11, f * 1.35));
+    } else if (name === "ptero") {
+      if (playSample("ptero", 1, 1)) {
+        tone(180, 0.25, "sawtooth", 0.012, 0, 60);
+        return;
+      }
+      tone(220, 0.55, "sawtooth", 0.04, 0, 70);
+      noise(0.5, 0.045, 0, 480, 140);
+    } else if (name === "lava") {
+      if (playSample("lava", 1, 1)) return;
+      noise(0.4, 0.07, 0, 180, 60);
+      tone(70, 0.35, "sawtooth", 0.035, 0, 32);
+    } else if (name === "bounce") {
+      if (playSample("thunk", 0.85, 1.12)) return;
+      noise(0.06, 0.04, 0, 350, 120);
+    } else if (name === "extra") {
+      if (playSample("freeman", 1, 1.05)) return;
+      [280, 360, 450, 560, 700].forEach((f, i) => tone(f, 0.1, "dac", 0.038, i * 0.08, f * 1.2));
+    } else if (name === "start") {
+      lockMusic(2.4);
+      if (playSample("start", 1, 1)) {
+        // thin synth harmonic under cabinet wav (no new ripped samples)
+        [90, 130, 175].forEach((f, i) => tone(f, 0.18, "dac", 0.014, i * 0.13, f * 1.45));
+        return;
+      }
+      [90, 130, 175, 230, 300, 390].forEach((f, i) => tone(f, 0.2, "dac", 0.04, i * 0.13, f * 1.45));
+    }
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  function clamp(v, a, b) {
+    return v < a ? a : v > b ? b : v;
+  }
+  function pad(n) {
+    return String(Math.floor(n) | 0).padStart(2, "0");
+  }
+  function rnd(a, b) {
+    return a + Math.random() * (b - a);
+  }
+  function chance(p) {
+    return Math.random() < p;
+  }
+  function wrapX(x) {
+    x %= VW;
+    if (x < 0) x += VW;
+    return x;
+  }
+  function wrapDelta(a, b) {
+    let d = b - a;
+    if (d > VW / 2) d -= VW;
+    if (d < -VW / 2) d += VW;
+    return d;
+  }
+
+  // ── Platforms — exact 3× arcade cliff IDs from playfield reference ───────
+  // Arcade y: CLIF1=69, CLIF2=81, CLIF3U=129, CLIF3L/R=138, CLIF4=163, CLIF5=211 → ×3
+  const BASE_PLATFORMS = [
+    // TOP-LEFT + TOP-RIGHT small ledges
+    { x: 3, y: 207, w: 102, h: 14, kind: "float", cliff: "CLIF1L" },
+    { x: 378, y: 207, w: 144, h: 14, kind: "float", cliff: "CLIF1R" },
+    // WIDE center float (upper)
+    { x: 129, y: 243, w: 264, h: 16, kind: "float", cliff: "CLIF2" },
+    // Medium CENTER float + LEFT/RIGHT mid floats
+    { x: 303, y: 387, w: 174, h: 16, kind: "float", cliff: "CLIF3U" },
+    { x: 3, y: 414, w: 192, h: 16, kind: "float", cliff: "CLIF3L" },
+    { x: 381, y: 414, w: 144, h: 16, kind: "float", cliff: "CLIF3R" },
+    // Lower medium center float
+    { x: 159, y: 489, w: 192, h: 16, kind: "float", cliff: "CLIF4" },
+    // Thin bridges flush with CLIF5 top (collapse n≥3) + big ground island
+    { x: 0, y: 633, w: 81, h: 10, kind: "bridge", cliff: "BRIDGE_L" },
+    { x: 81, y: 633, w: 558, h: 54, kind: "ground", cliff: "CLIF5" },
+    { x: 639, y: 633, w: 237, h: 10, kind: "bridge", cliff: "BRIDGE_R" },
+  ];
+  let PLATFORMS = BASE_PLATFORMS.map((p) => Object.assign({}, p));
+
+  // Lava band: full-width from ~660 (CLIF5 underside) to VH
+  const LAVA_LINE = 660;
+  const LAVA = [{ x: 0, y: LAVA_LINE, w: VW, h: VH - LAVA_LINE }];
+
+
+  // ── State ────────────────────────────────────────────────────────────────
+  let state = "title";
+  let score = 0;
+  let high = 0;
+  try {
+    high = Number(localStorage.getItem("joust_hi_v1") || 0);
+  } catch (_) {}
+  let wave = 1;
+  let lives = 3;
+  let extrasAt = 0;
+
+  let player = null;
+  let enemies = [];
+  let eggs = [];
+  let particles = [];
+  let ptero = null;
+  let pteros = []; // active pterodactyls (original can spawn more than one)
+  let hands = []; // lava troll grabs
+
+  let invuln = 0;
+  let waveT = 0;
+  let dieT = 0;
+  let clearT = 0;
+  let idleT = 0;
+  let titleT = 0;
+  let attractT = 0;
+  let overT = 0;
+  let attractPlay = false;
+  let attractFlapT = 0;
+  let eggStreak = 0;
+  let survivedWave = true;
+  let pteroTimer = 0; // hurry-up timer until next ptero
+  let pteroWavePending = 0; // dedicated ptero-wave extras to release
+  let message = "";
+  let messageT = 0;
+  let lavaAnim = 0;
+
+  const keys = Object.create(null);
+  let leftHeld = false;
+  let rightHeld = false;
+  let flapHeld = false;
+  let flapPulse = false; // one flap this frame
+
+  // ── Physics constants (arcade-paced) ─────────────────────────────────────
+  const GRAV = 480;
+  const FLAP_VY = -110; // V13: half of V12 flap power
+  const MAX_FALL = 300;
+  const MAX_RISE = -280;
+  const ACCEL_X = 390;
+  const MAX_VX = 185;
+  const GROUND_FRIC = 0.82;
+  const AIR_DRAG = 0.995;
+  const RIDER_R = 10; // collision / sprite scale
+
+  // ── HUD ──────────────────────────────────────────────────────────────────
+  function hud() {
+    if ($score) $score.textContent = pad(score);
+    if ($high) $high.textContent = pad(high);
+    if ($wave) $wave.textContent = String(wave);
+    if ($lives) {
+      let s = "";
+      for (let i = 0; i < Math.max(0, lives); i++) s += "▲";
+      $lives.textContent = s || "—";
+    }
+  }
+
+  function addScore(n) {
+    score += n;
+    if (!attractPlay) {
+      if (score > high) {
+        high = score;
+        try {
+          localStorage.setItem("joust_hi_v1", String(high));
+        } catch (_) {}
+      }
+      while (score >= (extrasAt + 1) * 20000) {
+        extrasAt++;
+        lives++;
+        sfx("extra");
+        flashMsg("EXTRA MOUNT!", 1500);
+      }
+    }
+    hud();
+  }
+
+  function showOV(title, sub, hint) {
+    if (!overlay) return;
+    overlay.classList.remove("hidden");
+    if ($title) $title.textContent = title;
+    if ($sub) $sub.textContent = sub || "";
+    if ($hint) $hint.textContent = hint || "";
+  }
+  function hideOV() {
+    if (overlay) overlay.classList.add("hidden");
+  }
+  function flashMsg(t, ms) {
+    message = t;
+    messageT = ms;
+  }
+
+  // ── Collision helpers ────────────────────────────────────────────────────
+  function solidAt(x, y, r) {
+    // feet / body against platform tops
+    for (const p of PLATFORMS) {
+      if (x + r > p.x && x - r < p.x + p.w && y + r > p.y && y + r < p.y + 12 && y < p.y + 4) {
+        return p;
+      }
+    }
+    return null;
+  }
+
+  function onLava(x, y) {
+    // Arcade: continuous lava under bottom; safe on any platform (not below lava line alone)
+    if (y < LAVA_LINE - 8) return false;
+    for (const p of PLATFORMS) {
+      if (x >= p.x - 4 && x <= p.x + p.w + 4 && y <= p.y + 22 && y >= p.y - 28) {
+        return false;
+      }
+    }
+    return y >= LAVA_LINE - 4;
+  }
+
+  // ── Entities ─────────────────────────────────────────────────────────────
+  function spawnPlayer(safe) {
+    // Player on CLIF5 top center; fall back to CLIF4 then any ledge
+    const clif5 = BASE_PLATFORMS.find((p) => p.cliff === "CLIF5");
+    const clif4 = BASE_PLATFORMS.find((p) => p.cliff === "CLIF4");
+    const pad = clif5 || clif4 || BASE_PLATFORMS[0];
+    player = {
+      x: pad.x + pad.w * 0.5,
+      y: pad.y - RIDER_R,
+      vx: 0,
+      vy: 0,
+      face: 1,
+      alive: true,
+      flapFrame: 0,
+      walkPhase: 0,
+      onGround: false,
+      grab: null,
+    };
+    if (safe) {
+      player.vy = 0;
+      player.onGround = true;
+    }
+    invuln = 2000;
+  }
+
+  function enemyTypeForWave(w, i) {
+    // Bounder → Hunter → Shadow Lord mix ramps
+    if (w <= 1) return "bounder";
+    if (w === 2) return i % 3 === 0 ? "hunter" : "bounder";
+    if (w === 3) return i % 2 === 0 ? "hunter" : "bounder";
+    if (w < 6) {
+      const r = i % 5;
+      if (r === 0) return "shadow";
+      if (r < 3) return "hunter";
+      return "bounder";
+    }
+    const r = i % 4;
+    if (r === 0) return "shadow";
+    if (r < 3) return "hunter";
+    return "bounder";
+  }
+
+  function makeEnemy(type, x, y) {
+    return {
+      type,
+      x,
+      y,
+      vx: chance(0.5) ? 60 : -60,
+      vy: 0,
+      face: 1,
+      alive: true,
+      flapT: rnd(0, 200),
+      flapFrame: 0,
+      walkPhase: 0,
+      aiT: rnd(200, 800),
+      onGround: false,
+      grab: null,
+      id: Math.random(),
+    };
+  }
+
+  function enemyPoints(type) {
+    if (type === "bounder") return 500;
+    if (type === "hunter") return 750;
+    if (type === "shadow") return 1000;
+    return 500;
+  }
+
+  function isSurvivalWave(n) {
+    return n === 2 || (n > 2 && (n - 2) % 5 === 0);
+  }
+  function isEggWave(n) {
+    return n > 0 && n % 5 === 0;
+  }
+
+  function layoutForWave(n) {
+    let list = BASE_PLATFORMS.map((p) => Object.assign({}, p));
+    const restored = n % 5 === 0; // egg waves restore all (Williams)
+    if (!restored) {
+      // n≥3: drop bridges — lava opens under sides of CLIF5
+      if (n >= 3) {
+        list = list.filter((p) => p.cliff !== "BRIDGE_L" && p.cliff !== "BRIDGE_R");
+      }
+      // n≥6: drop CLIF2
+      if (n >= 6) {
+        list = list.filter((p) => p.cliff !== "CLIF2");
+      }
+      // n≥7: drop CLIF1L + CLIF1R
+      if (n >= 7) {
+        list = list.filter((p) => p.cliff !== "CLIF1L" && p.cliff !== "CLIF1R");
+      }
+      // n≥8: drop CLIF4
+      if (n >= 8) {
+        list = list.filter((p) => p.cliff !== "CLIF4");
+      }
+    }
+    // CLIF3L / CLIF3U / CLIF3R / CLIF5 always kept
+    PLATFORMS = list;
+  }
+
+  /** Original-style: wave 8, then every 5th (13, 18, 23…) is a Pterodactyl wave. */
+  function isPteroWave(n) {
+    return n >= 8 && (n - 8) % 5 === 0;
+  }
+
+  function beginWave(n) {
+    wave = n;
+    enemies = [];
+    eggs = [];
+    ptero = null;
+    pteros = [];
+    hands = [];
+    idleT = 0;
+    eggStreak = 0;
+    survivedWave = true;
+    layoutForWave(n);
+    // Hurry-up: if wave drags on, a pterodactyl hunts the player (original ~20–45s).
+    // Dedicated ptero waves release one almost immediately after play starts.
+    if (isPteroWave(n)) {
+      pteroTimer = 900;
+      // Later ptero waves can release additional birds after the first
+      pteroWavePending = Math.min(2, 1 + Math.floor((n - 8) / 15));
+    } else {
+      pteroTimer = Math.max(16000, 42000 - Math.min(22000, (n - 1) * 1800));
+      pteroWavePending = 0;
+    }
+
+    // Enemy spawns on remaining floats (not bridges); fall back includes CLIF5
+    const spawnSpots = PLATFORMS.filter(
+      (p) => p.cliff !== "BRIDGE_L" && p.cliff !== "BRIDGE_R" && p.kind === "float"
+    ).map((p) => ({
+      x: p.x + p.w * 0.5,
+      y: p.y - RIDER_R - 4,
+    }));
+    if (!spawnSpots.length) {
+      for (const p of PLATFORMS) {
+        if (p.cliff === "BRIDGE_L" || p.cliff === "BRIDGE_R") continue;
+        spawnSpots.push({ x: p.x + p.w * 0.5, y: p.y - RIDER_R - 4 });
+      }
+    }
+    if (!spawnSpots.length) {
+      spawnSpots.push({ x: VW * 0.5, y: VH * 0.35 });
+    }
+
+    if (isEggWave(n)) {
+      const nEggs = Math.min(8 + Math.floor(n / 5), 12);
+      for (let i = 0; i < nEggs; i++) {
+        const p = PLATFORMS[i % PLATFORMS.length];
+        eggs.push({
+          x: p.x + 20 + (i * 37) % Math.max(20, p.w - 40),
+          y: p.y - 8,
+          vx: rnd(-35, 35),
+          vy: 0,
+          life: 12000,
+          onGround: true,
+          bounces: 3,
+          airborne: false,
+          fromType: "bounder",
+          id: Math.random(),
+        });
+      }
+    } else {
+      const count = Math.min(3 + n, 12);
+      for (let i = 0; i < count; i++) {
+        const type = enemyTypeForWave(n, i);
+        const spot = spawnSpots[i % spawnSpots.length];
+        const e = makeEnemy(type, spot.x + rnd(-20, 20), spot.y + rnd(-10, 10));
+        e.vy = rnd(20, 80);
+        enemies.push(e);
+      }
+    }
+
+    if (attractPlay) {
+      hideOV();
+      state = "attract";
+      hud();
+      return;
+    }
+    state = "wave";
+    waveT = 1600;
+    const sub = isEggWave(n) ? "EGG WAVE" : isSurvivalWave(n) ? "SURVIVAL WAVE" : "PREPARE TO JOUST";
+    showOV("WAVE " + wave, sub, "");
+    sfx("wave");
+    hud();
+  }
+
+  async function beginGame() {
+    await unlockAudio();
+    attractPlay = false;
+    leftHeld = false;
+    rightHeld = false;
+    flapHeld = false;
+    score = 0;
+    lives = 3;
+    wave = 1;
+    extrasAt = 0;
+    eggStreak = 0;
+    particles = [];
+    spawnPlayer(true);
+    sfx("start");
+    beginWave(1);
+  }
+
+  function goTitle() {
+    attractPlay = false;
+    leftHeld = false;
+    rightHeld = false;
+    flapHeld = false;
+    state = "title";
+    titleT = 4200;
+    layoutForWave(1);
+    spawnPlayer(true);
+    enemies = [];
+    eggs = [];
+    pteros = [];
+    ptero = null;
+    hands = [];
+    showOV("JOUST", "INSERT COIN", "BUILD V18 — INSERT COIN — PRESS SPACE / FLAP");
+    hud();
+  }
+
+  function beginAttract() {
+    attractPlay = true;
+    attractT = 45000;
+    attractFlapT = 0;
+    score = 0;
+    lives = 0;
+    extrasAt = 0;
+    eggStreak = 0;
+    particles = [];
+    pteros = [];
+    ptero = null;
+    spawnPlayer(true);
+    invuln = 2500;
+    beginWave(1);
+    hideOV();
+    state = "attract";
+    hud();
+  }
+
+  function nearestFoe() {
+    if (!player) return null;
+    let best = null, bestD = 1e9;
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      const d = Math.abs(wrapDelta(player.x, e.x)) + Math.abs(player.y - e.y) * 0.6;
+      if (d < bestD) { bestD = d; best = e; }
+    }
+    if (!best) {
+      for (const egg of eggs) {
+        if (egg.dead) continue;
+        const d = Math.abs(wrapDelta(player.x, egg.x)) + Math.abs(player.y - egg.y);
+        if (d < bestD) { bestD = d; best = egg; }
+      }
+    }
+    return best;
+  }
+
+  function attractThink(dt) {
+    if (!player || !player.alive) return;
+    attractFlapT -= dt;
+    const t = nearestFoe();
+    leftHeld = false;
+    rightHeld = false;
+    if (t) {
+      const dx = wrapDelta(player.x, t.x);
+      if (dx < -28) leftHeld = true;
+      else if (dx > 28) rightHeld = true;
+    }
+    const tooLow = player.y > LAVA_LINE - 100 || (t && player.y > t.y + 12);
+    const falling = player.vy > 80;
+    const onFloor = player.onGround;
+    if (attractFlapT <= 0 && (tooLow || falling || onFloor)) {
+      flapPulse = true;
+      attractFlapT = tooLow || falling ? rnd(150, 230) : rnd(220, 340);
+    }
+  }
+
+  function burst(x, y, color, n = 10) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = 40 + Math.random() * 140;
+      particles.push({
+        x,
+        y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp,
+        life: 200 + Math.random() * 400,
+        color,
+        size: 1 + ((Math.random() * 2) | 0),
+      });
+    }
+  }
+
+  function killPlayer() {
+    if (!player || !player.alive || invuln > 0) return;
+    burst(player.x, player.y, C.yellow, 16);
+    burst(player.x, player.y, C.white, 8);
+    sfx("die");
+    player.alive = false;
+    survivedWave = false;
+    if (attractPlay) {
+      state = "die";
+      dieT = 1400;
+      return;
+    }
+    lives--;
+    hud();
+    addScore(50);
+    state = "die";
+    dieT = 1600;
+  }
+
+  function defeatEnemy(e) {
+    if (!e.alive) return;
+    e.alive = false;
+    addScore(enemyPoints(e.type));
+    sfx("kill");
+    burst(e.x, e.y, e.type === "hunter" ? C.hunter : e.type === "shadow" ? C.shadow : C.bounder, 12);
+    // V15: arcade DEATH3 — egg inherits SAME velocities (JOUSTRV4 STEGG), no fake upward pop
+    eggs.push({
+      x: e.x + 4,
+      y: e.y - 8,
+      vx: e.vx,
+      vy: e.vy,
+      life: 12000,
+      onGround: false,
+      bounces: 0,
+      airborne: true,
+      fromType: e.type,
+      id: Math.random(),
+    });
+  }
+
+  function collectEgg(egg) {
+    egg.dead = true;
+    const pts = Math.min(1000, 250 + eggStreak * 250);
+    eggStreak++;
+    addScore(pts);
+    // arcade: egg grabbed midair before first bounce = +500 (CATID / PFEET)
+    if (egg.airborne) addScore(500);
+    sfx("egg");
+    burst(egg.x, egg.y, C.egg, 8);
+  }
+
+  function hatchEgg(egg) {
+    egg.dead = true;
+    sfx("hatch");
+    const from = egg.fromType || "bounder";
+    const type = from === "bounder" ? "hunter" : "shadow";
+    enemies.push(makeEnemy(type, egg.x, egg.y - 20));
+    burst(egg.x, egg.y, C.white, 6);
+  }
+
+  // ── Physics step for a rider ─────────────────────────────────────────────
+  function stepRider(r, dt, isPlayer) {
+    if (!r.alive || r.grab) return;
+
+    // horizontal control
+    if (isPlayer) {
+      if (leftHeld || keys.ArrowLeft || keys.KeyA || keys.a) {
+        r.face = -1;
+        r.vx -= ACCEL_X * (dt / 1000);
+      }
+      if (rightHeld || keys.ArrowRight || keys.KeyD || keys.d) {
+        r.face = 1;
+        r.vx += ACCEL_X * (dt / 1000);
+      }
+      if (flapPulse) {
+        r.vy = Math.min(r.vy, 0) + FLAP_VY;
+        r.flapFrame = 1;
+        r._flapHoldAcc = 0;
+        sfx("flap");
+      } else if (flapHeld) {
+        // soft sustained lift while held (arcade-feel assist, rate-limited)
+        r._flapHoldAcc = (r._flapHoldAcc || 0) + dt;
+        if (r._flapHoldAcc >= 85) {
+          r._flapHoldAcc = 0;
+          r.vy = Math.min(r.vy, 35) + FLAP_VY * 0.58;
+          r.flapFrame = 0.75;
+          sfx("flap");
+        }
+      } else {
+        r._flapHoldAcc = 0;
+      }
+    } else {
+      // AI: only flap when needed (too low, falling hard, or climbing to fight)
+      r.flapT -= dt;
+      if (r.flapT <= 0) {
+        r.flapT = r.type === "shadow" ? rnd(140, 280) : r.type === "hunter" ? rnd(180, 360) : rnd(220, 480);
+        const wantHeight =
+          r.type === "shadow" ? VH * 0.28 : r.type === "hunter" ? VH * 0.42 : VH * 0.5;
+        const tooLow = r.y > wantHeight + 40;
+        const fallingFast = r.vy > 90;
+        const nearFloor = r.y > LAVA_LINE - 90;
+        if (tooLow || fallingFast || nearFloor || chance(0.25)) {
+          r.vy = Math.min(r.vy, 40) + FLAP_VY * (r.type === "shadow" ? 0.95 : 0.88);
+          r.flapFrame = 1;
+        }
+        // If too high, skip flapping so gravity brings them down
+        if (r.y < 90) {
+          r.flapT = rnd(200, 400);
+        }
+      }
+    }
+
+    r.vx = clamp(r.vx, -MAX_VX, MAX_VX);
+    r.vy += GRAV * (dt / 1000);
+    r.vy = clamp(r.vy, MAX_RISE, MAX_FALL);
+    if (!r.onGround) r.vx *= Math.pow(AIR_DRAG, dt / 16);
+    else r.vx *= Math.pow(GROUND_FRIC, dt / 16);
+
+    r.x = wrapX(r.x + r.vx * (dt / 1000));
+    r.y += r.vy * (dt / 1000);
+
+    // ceiling — soft bounce down, don't pin riders at top
+    if (r.y < 50) {
+      r.y = 50;
+      r.vy = Math.max(60, Math.abs(r.vy) * 0.5);
+    }
+
+    // platforms
+    r.onGround = false;
+    const foot = r.y + RIDER_R;
+    for (const p of PLATFORMS) {
+      if (r.x > p.x - 6 && r.x < p.x + p.w + 6) {
+        // land on top
+        if (r.vy >= 0 && foot >= p.y && foot <= p.y + 16 && r.y < p.y + 10) {
+          r.y = p.y - RIDER_R;
+          r.vy = 0;
+          r.onGround = true;
+        }
+        // hit underside lightly
+        if (
+          r.vy < 0 &&
+          r.y - RIDER_R < p.y + p.h &&
+          r.y - RIDER_R > p.y &&
+          foot > p.y + p.h
+        ) {
+          r.y = p.y + p.h + RIDER_R;
+          r.vy = 30;
+        }
+      }
+    }
+
+    // Walking leg cycle when moving on a surface
+    if (r.onGround && Math.abs(r.vx) > 10) {
+      const prev = r.walkPhase || 0;
+      r.walkPhase = prev + Math.abs(r.vx) * (dt / 1000) * 0.14;
+      if (isPlayer && (prev | 0) !== (r.walkPhase | 0)) sfx("trot");
+    } else if (!r.onGround) {
+      r.walkPhase = 0;
+    }
+
+    // lava — troll grab from wave 4 (original); earlier waves still burn if you fall in
+    if (onLava(r.x, r.y + 10)) {
+      if (isPlayer) {
+        if (wave >= 4) {
+          sfx("lava");
+          hands.push({ x: r.x, y: LAVA_LINE + 8, life: 500, target: r });
+          r.grab = 400;
+          r.vy = 40;
+        } else {
+          sfx("lava");
+          killPlayer();
+        }
+      } else {
+        eDefeatSilent(r);
+      }
+    }
+
+    if (r.flapFrame > 0) r.flapFrame -= dt / 80;
+  }
+
+  function eDefeatSilent(e) {
+    e.alive = false;
+    burst(e.x, e.y, C.lava, 8);
+  }
+
+  // ── AI ───────────────────────────────────────────────────────────────────
+  function updateEnemyAI(e, dt) {
+    if (!e.alive || e.grab) return;
+    e.aiT -= dt;
+    if (e.aiT > 0) return;
+    e.aiT = e.type === "bounder" ? rnd(350, 800) : rnd(220, 500);
+
+    if (!player || !player.alive) {
+      e.vx = (chance(0.5) ? 1 : -1) * (50 + wave * 4);
+      e.face = Math.sign(e.vx) || 1;
+      return;
+    }
+
+    const dx = wrapDelta(e.x, player.x);
+    if (e.type === "bounder") {
+      if (chance(0.4)) e.vx = Math.sign(dx || 1) * (55 + wave * 3);
+      else e.vx = (chance(0.5) ? 1 : -1) * (50 + wave * 2);
+    } else if (e.type === "hunter") {
+      e.vx = Math.sign(dx || 1) * (70 + wave * 4);
+      // Prefer being slightly above player — flap only if clearly below
+      if (e.y > player.y + 30) e.flapT = Math.min(e.flapT, 40);
+    } else if (e.type === "shadow") {
+      e.vx = Math.sign(dx || 1) * (90 + wave * 5);
+      // Shadow lords prefer mid-high, not ceiling-camping
+      if (e.y > VH * 0.35) e.flapT = Math.min(e.flapT, 50);
+      if (e.y < 100) e.flapT = rnd(300, 500); // force coast downward
+    }
+    e.face = Math.sign(e.vx) || 1;
+  }
+
+  // ── Combat ───────────────────────────────────────────────────────────────
+  function lanceY(r) {
+    // lance roughly at rider torso height
+    return r.y - 2;
+  }
+
+  function tryClash(a, b) {
+    if (!a.alive || !b.alive) return;
+    const dx = Math.abs(wrapDelta(a.x, b.x));
+    const dy = Math.abs(a.y - b.y);
+    if (dx > 24 || dy > 22) return;
+
+    const ay = lanceY(a);
+    const by = lanceY(b);
+    const diff = by - ay; // positive if a is higher (smaller y)
+
+    if (Math.abs(ay - by) < 5) {
+      // equal — bounce
+      const dir = Math.sign(wrapDelta(a.x, b.x)) || 1;
+      a.vx = -dir * 120;
+      b.vx = dir * 120;
+      a.vy = -40;
+      b.vy = -40;
+      sfx("bounce");
+      return;
+    }
+    if (ay < by - 4) {
+      // a higher — a wins
+      if (a === player) defeatEnemy(b);
+      else if (b === player) killPlayer();
+      else {
+        // enemy vs enemy rare
+        defeatEnemy(b);
+      }
+    } else if (by < ay - 4) {
+      if (b === player) defeatEnemy(a);
+      else if (a === player) killPlayer();
+      else defeatEnemy(a);
+    }
+  }
+
+  // ── Pterodactyl (original-style intervals + HD art) ─────────────────────
+  function spawnPtero(opts) {
+    opts = opts || {};
+    const dir = opts.dir != null ? opts.dir : chance(0.5) ? 1 : -1;
+    // Original flies at a steady cruise; slightly faster on later waves
+    const speed = 130 + Math.min(60, wave * 3.5) + (opts.fast ? 30 : 0);
+    const lanes = [95, 150, 210, 270, 330, 390];
+    const laneY = opts.y != null ? opts.y : lanes[(Math.random() * lanes.length) | 0];
+    const pt = {
+      x: dir > 0 ? -50 : VW + 50,
+      y: laneY,
+      vx: dir * speed,
+      frame: Math.random() * 1000,
+      alive: true,
+      // mouth opens/closes on a cycle (must spear open mouth to kill)
+      mouthPhase: Math.random() * Math.PI * 2,
+    };
+    pteros.push(pt);
+    ptero = pt; // keep legacy single ref for any old paths
+    sfx("ptero");
+    if (!opts.silentMsg) flashMsg("PTERODACTYL!", 1100);
+    return pt;
+  }
+
+  function pteroMouthOpen(pt) {
+    // Jaw cycles open/closed — killable only when open (original lance-to-mouth)
+    return Math.sin(pt.mouthPhase) > 0.15;
+  }
+
+  function pteroMouthPos(pt) {
+    // Facing: positive vx = flying right, mouth on right side
+    const face = pt.vx >= 0 ? 1 : -1;
+    const s = 0.92; // match drawOnePtero scale
+    return {
+      x: pt.x + face * 30 * s,
+      y: pt.y + 0.5 * s,
+      face,
+    };
+  }
+
+  function updatePteros(dt) {
+    // Spawn schedule
+    pteroTimer -= dt;
+    if (pteroTimer <= 0) {
+      const active = pteros.filter((p) => p.alive).length;
+      if (active < 3) {
+        spawnPtero({ silentMsg: active > 0 });
+      }
+      if (pteroWavePending > 0) {
+        pteroWavePending--;
+        // Stagger extra ptero-wave releases ~2.5s apart
+        pteroTimer = 2500;
+      } else {
+        // Next hurry-up / re-entry after leaving (original keeps pressure)
+        pteroTimer = Math.max(12000, 30000 - wave * 900);
+      }
+    }
+
+    for (const pt of pteros) {
+      if (!pt.alive) continue;
+      pt.frame += dt;
+      pt.mouthPhase += dt * 0.0065; // open/close cycle ~similar cadence to original
+
+      // Cruise horizontally
+      pt.x += pt.vx * (dt / 1000);
+
+      // Gently home toward player's altitude (classic hunting pass)
+      if (player && player.alive) {
+        const targetY = clamp(player.y + Math.sin(pt.frame / 280) * 12, 70, LAVA_LINE - 80);
+        const dy = targetY - pt.y;
+        pt.y += clamp(dy * 1.1, -55, 55) * (dt / 1000);
+        // Slight speed-up when chasing on same altitude
+        if (Math.abs(dy) < 40) {
+          const boost = 1 + Math.min(0.25, wave * 0.01);
+          pt.x += (pt.vx * (boost - 1)) * (dt / 1000);
+        }
+      } else {
+        pt.y += Math.sin(pt.frame / 220) * 0.35;
+      }
+      pt.y = clamp(pt.y, 60, LAVA_LINE - 60);
+
+      // Off-screen: reverse for another pass at a new lane (original re-entry)
+      if (pt.x < -90 || pt.x > VW + 90) {
+        pt.vx *= -1;
+        const lanes = [90, 140, 200, 260, 320, 380];
+        pt.y = lanes[(Math.random() * lanes.length) | 0];
+        pt.x = pt.vx > 0 ? -50 : VW + 50;
+      }
+
+      // Combat vs player
+      if (player && player.alive && invuln <= 0) {
+        const m = pteroMouthPos(pt);
+        const open = pteroMouthOpen(pt);
+        const dx = wrapDelta(player.x, pt.x);
+        const dy = player.y - pt.y;
+        const bodyHit = Math.abs(dx) < 26 && Math.abs(dy) < 14;
+        // Lance tip approx: slightly ahead of and above rider center
+        const lanceX = player.x + player.face * 18;
+        const lanceY = player.y - 8;
+        const mouthDx = Math.abs(lanceX - m.x);
+        const mouthDy = Math.abs(lanceY - m.y);
+        const spearMouth = open && mouthDx < 14 && mouthDy < 10;
+
+        if (spearMouth) {
+          // Precise mouth kill (original 1000 pts)
+          pt.alive = false;
+          addScore(1000);
+          sfx("kill");
+          burst(pt.x, pt.y, C.ptero, 24);
+          burst(m.x, m.y, C.yellow, 10);
+          flashMsg("PTERODACTYL DEFEATED!", 1400);
+        } else if (bodyHit) {
+          // Body / closed beak contact kills the player
+          killPlayer();
+        }
+      }
+    }
+    pteros = pteros.filter((p) => p.alive);
+    ptero = pteros.length ? pteros[0] : null;
+  }
+
+  // ── Update ───────────────────────────────────────────────────────────────
+  function update(dt) {
+    lavaAnim += dt;
+    if (messageT > 0) messageT -= dt;
+    if (invuln > 0) invuln -= dt;
+
+    if (state === "pause") {
+      flapPulse = false;
+      return;
+    }
+    if (state === "title") {
+      titleT -= dt;
+      if (titleT <= 0) beginAttract();
+      flapPulse = false;
+      return;
+    }
+    if (state === "over") {
+      overT -= dt;
+      if (overT <= 0) goTitle();
+      flapPulse = false;
+      return;
+    }
+
+    if (state === "wave") {
+      waveT -= dt;
+      updateParticles(dt);
+      if (waveT <= 0) {
+        state = "play";
+        hideOV();
+      }
+      flapPulse = false;
+      return;
+    }
+
+    if (state === "die") {
+      dieT -= dt;
+      updateParticles(dt);
+      if (dieT <= 0) {
+        if (attractPlay) {
+          spawnPlayer(true);
+          invuln = 2200;
+          state = "attract";
+          hideOV();
+        } else if (lives <= 0) {
+          state = "over";
+          overT = 8000;
+          showOV("GAME OVER", "SCORE " + pad(score), "PRESS FLAP OR TAP");
+        } else {
+          spawnPlayer(true);
+          state = "play";
+          hideOV();
+        }
+      }
+      flapPulse = false;
+      return;
+    }
+
+    if (state === "clear") {
+      clearT -= dt;
+      updateParticles(dt);
+      if (clearT <= 0) beginWave(wave + 1);
+      flapPulse = false;
+      return;
+    }
+
+    if (state !== "play" && state !== "attract") {
+      flapPulse = false;
+      return;
+    }
+
+    if (state === "attract") {
+      attractT -= dt;
+      if (attractT <= 0) {
+        goTitle();
+        flapPulse = false;
+        return;
+      }
+      attractThink(dt);
+    }
+
+    // Player grab by lava troll — mash flap to escape (original)
+    if (player && player.grab) {
+      if (state === "attract") attractThink(dt);
+      player.grab -= dt;
+      if (flapPulse) {
+        player.grab -= 140;
+        player.vy = FLAP_VY * 0.45;
+        sfx("flap");
+      }
+      player.y += 28 * (dt / 1000);
+      flapPulse = false;
+      if (player.grab <= 0) {
+        if (player.vy < -20) {
+          player.grab = null;
+        } else {
+          killPlayer();
+        }
+      }
+      updateParticles(dt);
+      return;
+    }
+
+    stepRider(player, dt, true);
+    flapPulse = false;
+
+    // Enemies
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      if (e.grab) {
+        e.grab -= dt;
+        e.y += 50 * (dt / 1000);
+        if (e.grab <= 0) eDefeatSilent(e);
+        continue;
+      }
+      updateEnemyAI(e, dt);
+      stepRider(e, dt, false);
+      if (player && player.alive && invuln <= 0) tryClash(player, e);
+    }
+    enemies = enemies.filter((e) => e.alive);
+
+    // Eggs — Williams JOUSTRV4: inherit vel, bounce vy/4 + vx step toward 0, then sit
+    for (const egg of eggs) {
+      if (egg.dead) continue;
+      const dtS = dt / 1000;
+
+      if (!egg.onGround) {
+        egg.vy += GRAV * dtS;
+        egg.x = wrapX(egg.x + egg.vx * dtS);
+        egg.y += egg.vy * dtS;
+
+        for (const p of PLATFORMS) {
+          if (
+            egg.x > p.x + 2 &&
+            egg.x < p.x + p.w - 2 &&
+            egg.y + 7 >= p.y &&
+            egg.y < p.y + 14 &&
+            egg.vy > 0
+          ) {
+            egg.y = p.y - 7;
+            egg.bounces = (egg.bounces || 0) + 1;
+            egg.airborne = false;
+            // arcade EGGBON: vx steps toward 0 by 2 units; vy = -vy/4
+            const step = 55;
+            if (egg.vx > 0) egg.vx = Math.max(0, egg.vx - step);
+            else if (egg.vx < 0) egg.vx = Math.min(0, egg.vx + step);
+            egg.vy = -Math.abs(egg.vy) * 0.25;
+            if (Math.abs(egg.vy) < 35 && Math.abs(egg.vx) < 12) {
+              egg.vy = 0;
+              egg.vx = 0;
+              egg.onGround = true;
+            }
+            sfx("thunk");
+            break;
+          }
+        }
+      } else {
+        // arcade EGGLND: rest on ledge until hatch (no slow-roll)
+        egg.vy = 0;
+        egg.vx = 0;
+        let onPlat = null;
+        for (const p of PLATFORMS) {
+          if (egg.x > p.x && egg.x < p.x + p.w && Math.abs(egg.y + 7 - p.y) < 4) {
+            onPlat = p;
+            egg.y = p.y - 7;
+            break;
+          }
+        }
+        if (!onPlat) {
+          egg.onGround = false;
+          egg.airborne = false;
+        } else if (egg.x <= onPlat.x + 4 || egg.x >= onPlat.x + onPlat.w - 4) {
+          egg.onGround = false;
+          egg.airborne = false;
+          egg.vy = 20;
+        }
+      }
+
+      if (onLava(egg.x, egg.y)) {
+        egg.dead = true;
+        burst(egg.x, egg.y, C.lava, 5);
+      }
+      egg.life -= dt;
+      if (egg.onGround && egg.life < 2000) {
+        hatchEgg(egg);
+      }
+      if (player && player.alive && Math.abs(wrapDelta(player.x, egg.x)) < 16 && Math.abs(player.y - egg.y) < 16) {
+        collectEgg(egg);
+      }
+    }
+    eggs = eggs.filter((e) => !e.dead);
+
+
+    // Pterodactyl (hurry-up + dedicated ptero waves)
+    idleT += dt;
+    updatePteros(dt);
+
+    // Hands cleanup
+    for (const h of hands) h.life -= dt;
+    hands = hands.filter((h) => h.life > 0);
+
+    // Wave clear
+    if (enemies.length === 0 && eggs.length === 0) {
+      if (attractPlay) {
+        spawnPlayer(true);
+        invuln = 2000;
+        beginWave(wave < 3 ? wave + 1 : 1);
+        hideOV();
+        state = "attract";
+        return;
+      }
+      if (isSurvivalWave(wave) && survivedWave) {
+        addScore(3000);
+        flashMsg("SURVIVAL BONUS 3000", 1600);
+      }
+      state = "clear";
+      clearT = 1800;
+      showOV("WAVE " + wave, "COMPLETED", "");
+      sfx("wave");
+    }
+
+    updateParticles(dt);
+  }
+
+  function updateParticles(dt) {
+    for (const p of particles) {
+      p.x += p.vx * (dt / 1000);
+      p.y += p.vy * (dt / 1000);
+      p.life -= dt;
+    }
+    particles = particles.filter((p) => p.life > 0);
+  }
+
+  // ── Draw — Williams-style arena + animated walk cycle ───────────────────
+  function fillRect(x, y, w, h, col) {
+    ctx.fillStyle = col;
+    ctx.fillRect(x, y, w, h);
+  }
+
+  function oval(x, y, rx, ry, col) {
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.4, rx), Math.max(0.4, ry), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function rockShelf(p) {
+    const { x, y, w, h } = p;
+    const ground = p.kind === "ground" || p.cliff === "CLIF5";
+    const bridge = p.kind === "bridge";
+
+    if (bridge) {
+      // Very thin brown ledge flush with CLIF5 top
+      const bh = Math.min(h, 10);
+      const g = ctx.createLinearGradient(0, y, 0, y + bh);
+      g.addColorStop(0, "#c87840");
+      g.addColorStop(0.4, "#8a4820");
+      g.addColorStop(1, "#4a2410");
+      ctx.fillStyle = g;
+      ctx.fillRect(x, y, w, bh);
+      ctx.fillStyle = "#e8a868";
+      ctx.fillRect(x, y, w, 2);
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.fillRect(x, y + bh - 2, w, 2);
+      return;
+    }
+
+    if (ground) {
+      // Wide island: flat top, taller irregular underside into lava, score wells
+      const bodyH = Math.max(h, 48);
+      ctx.beginPath();
+      ctx.moveTo(x, y + 2);
+      const topSteps = Math.max(10, (w / 20) | 0);
+      for (let i = 0; i <= topSteps; i++) {
+        const t = i / topSteps;
+        const px = x + t * w;
+        const jag = (i === 0 || i === topSteps) ? 1 : Math.sin(i * 2.1) * 1.2;
+        ctx.lineTo(px, y + jag);
+      }
+      // Irregular underside dipping toward lava
+      const bot = Math.min(VH, y + bodyH + 8);
+      ctx.lineTo(x + w + 2, y + bodyH * 0.55);
+      const botSteps = Math.max(12, (w / 18) | 0);
+      for (let i = botSteps; i >= 0; i--) {
+        const t = i / botSteps;
+        const px = x + t * w;
+        const dip = Math.sin(i * 1.4 + 0.5) * 10 + Math.sin(i * 0.55) * 6;
+        ctx.lineTo(px, bot - 8 + dip);
+      }
+      ctx.lineTo(x - 2, y + bodyH * 0.55);
+      ctx.closePath();
+      const g = ctx.createLinearGradient(0, y, 0, bot);
+      g.addColorStop(0, C.rockLt);
+      g.addColorStop(0.2, C.rock);
+      g.addColorStop(0.55, C.rockMid);
+      g.addColorStop(1, C.rockDk);
+      ctx.fillStyle = g;
+      ctx.fill();
+      // Flat bright top highlight
+      ctx.fillStyle = C.rockRim;
+      ctx.fillRect(x + 1, y, w - 2, 3);
+      ctx.fillStyle = "#ffe0a0";
+      ctx.fillRect(x + 4, y + 1, w - 8, 1.5);
+      // Recessed dark score wells (arcade pad look)
+      const wellW = Math.min(70, w * 0.16);
+      const wellH = 14;
+      const wells = [0.18, 0.42, 0.66];
+      for (const wt of wells) {
+        const wx = x + w * wt;
+        ctx.fillStyle = "rgba(20,8,0,0.55)";
+        ctx.fillRect(wx, y + 10, wellW, wellH);
+        ctx.strokeStyle = "rgba(0,0,0,0.4)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(wx + 0.5, y + 10.5, wellW - 1, wellH - 1);
+        ctx.fillStyle = "rgba(200,120,40,0.15)";
+        ctx.fillRect(wx + 2, y + 11, wellW - 4, 2);
+      }
+      // Rocky cracks
+      ctx.strokeStyle = "rgba(40,16,4,0.4)";
+      ctx.lineWidth = 1;
+      for (let i = 24; i < w - 20; i += 36) {
+        ctx.beginPath();
+        ctx.moveTo(x + i, y + 8);
+        ctx.lineTo(x + i + 8, y + bodyH * 0.45);
+        ctx.stroke();
+      }
+      return;
+    }
+
+    // Float shelves: THIN — bright top edge + short jagged underside (8–14px)
+    const shelf = Math.min(Math.max(h, 12), 16);
+    const under = 10 + (Math.sin(x * 0.03) * 2 | 0); // 8–12-ish jagged depth feel
+    ctx.beginPath();
+    ctx.moveTo(x, y + shelf + under);
+    ctx.lineTo(x - 1, y + 3);
+    const steps = Math.max(6, (w / 16) | 0);
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const px = x + t * w;
+      const jag = (i === 0 || i === steps) ? 0.5 : Math.sin(i * 2.3 + x * 0.02) * 1.1;
+      ctx.lineTo(px, y + jag);
+    }
+    ctx.lineTo(x + w + 1, y + 3);
+    // Jagged rocky underside (short — not fat bricks)
+    for (let i = steps; i >= 0; i--) {
+      const t = i / steps;
+      const px = x + t * w;
+      const jag = 2 + Math.abs(Math.sin(i * 1.8 + x * 0.015)) * 6;
+      ctx.lineTo(px, y + 6 + jag);
+    }
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, y, 0, y + shelf + under);
+    g.addColorStop(0, "#f0a868");
+    g.addColorStop(0.25, C.rockLt);
+    g.addColorStop(0.55, C.rock);
+    g.addColorStop(1, C.rockDk);
+    ctx.fillStyle = g;
+    ctx.fill();
+    // Flat bright orange/tan TOP highlight edge
+    ctx.fillStyle = "#ffe090";
+    ctx.fillRect(x + 1, y, w - 2, 2.5);
+    ctx.fillStyle = C.rockRim;
+    ctx.fillRect(x + 2, y + 2, w - 4, 1.5);
+    // Subtle rock texture on short face
+    ctx.fillStyle = "rgba(0,0,0,0.28)";
+    for (let i = 10; i < w - 8; i += 14) {
+      const uy = y + 7 + (i % 5);
+      ctx.fillRect(x + i, uy, 3, 2);
+    }
+    // Optional gray transporter pads on CLIF2 / CLIF3U
+    if (p.cliff === "CLIF2" || p.cliff === "CLIF3U") {
+      const padW = Math.min(28, w * 0.22);
+      const px1 = x + w * 0.22;
+      const px2 = x + w * 0.62;
+      ctx.fillStyle = "rgba(160,160,170,0.55)";
+      ctx.fillRect(px1, y - 2, padW, 4);
+      ctx.fillRect(px2, y - 2, padW, 4);
+      ctx.fillStyle = "rgba(210,210,220,0.4)";
+      ctx.fillRect(px1 + 2, y - 1, padW - 4, 1.5);
+      ctx.fillRect(px2 + 2, y - 1, padW - 4, 1.5);
+    }
+  }
+
+  function drawBackground() {
+    // Pure black void — no starfield haze (arcade look)
+    fillRect(0, 0, VW, VH, C.black);
+  }
+
+  function drawLava() {
+    const pulse = 0.5 + 0.5 * Math.sin(lavaAnim / 130);
+    // Full-width red/orange band with edge flames
+    fillRect(0, LAVA_LINE - 4, VW, VH - (LAVA_LINE - 4), "#120200");
+    const glow = ctx.createLinearGradient(0, LAVA_LINE - 28, 0, VH);
+    glow.addColorStop(0, "rgba(255,80,0,0)");
+    glow.addColorStop(0.3, "rgba(255,90,0,0.22)");
+    glow.addColorStop(1, "rgba(255,30,0,0.5)");
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, LAVA_LINE - 28, VW, VH - (LAVA_LINE - 28));
+    const lg = ctx.createLinearGradient(0, LAVA_LINE, 0, VH);
+    lg.addColorStop(0, C.lavaCore);
+    lg.addColorStop(0.15, C.lavaHot);
+    lg.addColorStop(0.45, C.lava);
+    lg.addColorStop(1, "#400800");
+    ctx.fillStyle = lg;
+    ctx.beginPath();
+    ctx.moveTo(0, LAVA_LINE + 2);
+    const segs = 28;
+    for (let i = 0; i <= segs; i++) {
+      const t = i / segs;
+      ctx.lineTo(
+        t * VW,
+        LAVA_LINE + Math.sin(t * Math.PI * 6 + lavaAnim / 90) * 5 * pulse
+      );
+    }
+    ctx.lineTo(VW, VH);
+    ctx.lineTo(0, VH);
+    ctx.closePath();
+    ctx.fill();
+    // Edge flame tips
+    for (let i = 0; i < 22; i++) {
+      const fx = 8 + ((lavaAnim / 25 + i * 47) % (VW - 16));
+      const fh = 6 + (i % 4) * 2 + pulse * 3;
+      const fy = LAVA_LINE + 2 - fh * 0.35;
+      ctx.fillStyle = i % 2 ? C.lavaCore : C.lavaHot;
+      ctx.beginPath();
+      ctx.moveTo(fx - 3, LAVA_LINE + 4);
+      ctx.lineTo(fx, fy);
+      ctx.lineTo(fx + 3, LAVA_LINE + 4);
+      ctx.closePath();
+      ctx.fill();
+    }
+    for (let i = 0; i < 16; i++) {
+      const bx = 12 + ((lavaAnim / 30 + i * 53) % (VW - 24));
+      const by = LAVA_LINE + 8 + ((i * 7 + lavaAnim / 45) % 18);
+      oval(bx, by, 2 + (i % 3), 1.5, C.lavaCore);
+    }
+  }
+
+  function drawPlatforms() {
+    // floats/bridges first, then ground island so CLIF5 draws on top of lava edge
+    for (const p of PLATFORMS) {
+      if (p.kind === "float" || p.kind === "bridge") rockShelf(p);
+    }
+    for (const p of PLATFORMS) {
+      if (p.kind === "ground") rockShelf(p);
+    }
+  }
+
+  // ── Ultra-HD vector characters (smooth remake, not pixel art) ────────────
+  function shade(base, amt) {
+    if (!base || base[0] !== "#" || base.length < 7) return base;
+    const n = parseInt(base.slice(1), 16);
+    let r = (n >> 16) & 255,
+      g = (n >> 8) & 255,
+      b = n & 255;
+    r = Math.max(0, Math.min(255, (r + amt) | 0));
+    g = Math.max(0, Math.min(255, (g + amt) | 0));
+    b = Math.max(0, Math.min(255, (b + amt) | 0));
+    return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+  }
+
+  function ell(x, y, rx, ry, col) {
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.15, rx), Math.max(0.15, ry), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function gradEll(x, y, rx, ry, c0, c1, ang) {
+    const a = ang || 0;
+    const g = ctx.createLinearGradient(
+      x - Math.cos(a) * rx,
+      y - Math.sin(a) * ry,
+      x + Math.cos(a) * rx,
+      y + Math.sin(a) * ry
+    );
+    g.addColorStop(0, c0);
+    g.addColorStop(1, c1);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.15, rx), Math.max(0.15, ry), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function radEll(x, y, rx, ry, c0, c1) {
+    const g = ctx.createRadialGradient(x - rx * 0.35, y - ry * 0.35, rx * 0.08, x, y, Math.max(rx, ry));
+    g.addColorStop(0, c0);
+    g.addColorStop(1, c1);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.15, rx), Math.max(0.15, ry), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  /** Soft outline so silhouettes read clearly without blocky pixels */
+  function softStroke(pathFn, width, col) {
+    ctx.save();
+    ctx.strokeStyle = col;
+    ctx.lineWidth = width;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    pathFn();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function roundedBand(x, y, w, h, col) {
+    const r = Math.min(h / 2, w / 4);
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function strokeCurve(pts, width, col) {
+    if (pts.length < 2) return;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = width;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length - 1; i++) {
+      const xc = (pts[i][0] + pts[i + 1][0]) / 2;
+      const yc = (pts[i][1] + pts[i + 1][1]) / 2;
+      ctx.quadraticCurveTo(pts[i][0], pts[i][1], xc, yc);
+    }
+    const last = pts[pts.length - 1];
+    ctx.lineTo(last[0], last[1]);
+    ctx.stroke();
+  }
+
+  function drawBirdLegs(r, walking) {
+    const legCol = "#f8e050";
+    const darkLeg = "#c9a018";
+    const nail = "#ffe878";
+    const nailDk = "#a88810";
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    function foot(fx, fy, ang) {
+      ctx.save();
+      ctx.translate(fx, fy);
+      ctx.rotate(ang || 0);
+      // rounder three-toed foot (soft pads + bulb tips)
+      for (const [tx, ty, tw] of [
+        [5.4, 0.25, 2.15],
+        [4.6, 2.35, 1.85],
+        [4.2, -2.05, 1.85],
+      ]) {
+        ctx.strokeStyle = nailDk;
+        ctx.lineWidth = tw + 0.55;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(0.15, 0);
+        ctx.quadraticCurveTo(tx * 0.42, ty * 0.38, tx, ty);
+        ctx.stroke();
+        ctx.strokeStyle = nail;
+        ctx.lineWidth = tw;
+        ctx.beginPath();
+        ctx.moveTo(0.15, 0);
+        ctx.quadraticCurveTo(tx * 0.42, ty * 0.38, tx, ty);
+        ctx.stroke();
+        // round claw bulb (not sharp triangle)
+        radEll(tx * 1.02, ty * 1.02, 0.85, 0.7, nail, nailDk);
+        ell(tx * 1.02 - 0.15, ty * 1.02 - 0.12, 0.32, 0.28, "rgba(255,255,255,0.28)");
+      }
+      // rear toe — soft curve
+      ctx.strokeStyle = nailDk;
+      ctx.lineWidth = 1.7;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.quadraticCurveTo(-1.4, 0.9, -3.0, 1.35);
+      ctx.stroke();
+      ctx.strokeStyle = nail;
+      ctx.lineWidth = 1.25;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.quadraticCurveTo(-1.4, 0.9, -3.0, 1.35);
+      ctx.stroke();
+      radEll(-3.0, 1.35, 0.7, 0.55, nail, nailDk);
+      // puffier foot pad
+      radEll(0.15, 0.15, 2.55, 1.85, legCol, darkLeg);
+      ell(-0.3, -0.35, 1.1, 0.75, "rgba(255,255,200,0.22)");
+      ctx.restore();
+    }
+
+    if (!walking) {
+      // flight: legs tucked under, slightly trailing
+      strokeCurve(
+        [
+          [-3.5, 5],
+          [-5.5, 9],
+          [-7.5, 12.5],
+        ],
+        3.2,
+        darkLeg
+      );
+      strokeCurve(
+        [
+          [-3.5, 5],
+          [-5.2, 8.5],
+          [-7.2, 12],
+        ],
+        2.4,
+        legCol
+      );
+      strokeCurve(
+        [
+          [3.2, 5],
+          [5.8, 9],
+          [7.8, 12.5],
+        ],
+        3.2,
+        darkLeg
+      );
+      strokeCurve(
+        [
+          [3.2, 5],
+          [5.5, 8.5],
+          [7.5, 12],
+        ],
+        2.4,
+        legCol
+      );
+      foot(-7.5, 12.5, 0.55);
+      foot(7.8, 12.5, -0.35);
+      return;
+    }
+
+    const phase = r.walkPhase || 0;
+    const a = Math.sin(phase * Math.PI * 2);
+    const b = Math.sin(phase * Math.PI * 2 + Math.PI);
+
+    function walkLeg(hipX, swing, lift) {
+      const kneeX = hipX + swing * 0.5;
+      const kneeY = 7.6 - lift;
+      const footX = hipX + swing * 1.15;
+      const footY = 13.4 - lift * 0.12;
+      // thigh (shadow then light)
+      strokeCurve(
+        [
+          [hipX, 3.8],
+          [hipX + swing * 0.18, 5.6 - lift * 0.35],
+          [kneeX, kneeY],
+        ],
+        3.6,
+        darkLeg
+      );
+      strokeCurve(
+        [
+          [hipX, 3.8],
+          [hipX + swing * 0.18, 5.6 - lift * 0.35],
+          [kneeX, kneeY],
+        ],
+        2.6,
+        legCol
+      );
+      // shin
+      strokeCurve(
+        [
+          [kneeX, kneeY],
+          [(kneeX + footX) / 2 + swing * 0.05, (kneeY + footY) / 2],
+          [footX, footY],
+        ],
+        3.0,
+        darkLeg
+      );
+      strokeCurve(
+        [
+          [kneeX, kneeY],
+          [(kneeX + footX) / 2, (kneeY + footY) / 2],
+          [footX, footY],
+        ],
+        2.2,
+        legCol
+      );
+      radEll(kneeX, kneeY, 1.8, 1.7, shade(legCol, 20), darkLeg);
+      foot(footX, footY, swing * 0.1);
+    }
+
+    walkLeg(-3.8, a * 7.5, Math.max(0, -a) * 4.2);
+    walkLeg(4.0, b * 7.5, Math.max(0, -b) * 4.2);
+  }
+
+  /**
+   * High-detail knight + ostrich/buzzard — rounder Pac/DigDug-hybrid silhouettes.
+   * Soft ellipses + wing arcs; HD from canvas SCALE (no ripped pixels).
+   */
+  function drawRider(r, color, dark, wingCol) {
+    if (!r.alive) return;
+    const facing = r.face;
+    const flap = r.flapFrame > 0;
+    const walking = !!(r.onGround && Math.abs(r.vx) > 8);
+    // Half of v8 size — closer to classic Joust on-screen scale. Sharpness from canvas SCALE.
+    const s = 0.69;
+
+    ctx.save();
+    ctx.translate(r.x, r.y);
+    ctx.scale(facing * s, s);
+
+    // Soft ground contact shadow
+    if (r.onGround) {
+      const sg = ctx.createRadialGradient(0, 14.5, 1, 0, 14.5, 14);
+      sg.addColorStop(0, "rgba(0,0,0,0.45)");
+      sg.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = sg;
+      ctx.beginPath();
+      ctx.ellipse(0, 14.5, 14, 3.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    const hi = shade(color, 55);
+    const mid = wingCol || shade(color, 22);
+    const lo = dark || shade(color, -48);
+    const deep = shade(color, -75);
+    const belly = shade(color, 35);
+
+    // Rider kit separate from bird body (Williams attract)
+    let armor = "#f4f6fa";
+    let armorMid = "#c8cdd8";
+    let armorDk = "#6e7588";
+    let steel = "#9aa4b4";
+    let plumeCol = C.yellow;
+    let neckCol = color;
+    let neckHi = hi;
+    let neckLo = lo;
+    if (color === C.player) {
+      armor = C.playerRider;
+      armorMid = shade(C.playerRider, -25);
+      armorDk = C.playerRiderDk;
+      steel = shade(C.playerRider, 40);
+      plumeCol = "#ffe868";
+      neckCol = C.playerNeck;
+      neckHi = "#ffffff";
+      neckLo = shade(C.playerNeck, -35);
+    } else if (color === C.bounder) {
+      armor = C.bounderRider;
+      armorMid = shade(C.bounderRider, -22);
+      armorDk = C.bounderRiderDk;
+      steel = shade(C.bounderRider, 45);
+      plumeCol = "#90e040";
+      neckCol = shade(color, 40);
+      neckHi = shade(color, 70);
+      neckLo = dark || shade(color, -40);
+    } else if (color === C.hunter) {
+      armor = C.hunterRider;
+      armorMid = shade(C.hunterRider, -20);
+      armorDk = C.hunterRiderDk;
+      steel = "#d8dce8";
+      plumeCol = "#ff5040";
+      neckCol = shade(color, 25);
+      neckHi = "#f0f0f8";
+      neckLo = dark || shade(color, -40);
+    } else if (color === C.shadow) {
+      armor = C.shadowRider;
+      armorMid = shade(C.shadowRider, -22);
+      armorDk = C.shadowRiderDk;
+      steel = shade(C.shadowRider, 50);
+      plumeCol = "#8080ff";
+      neckCol = shade(color, 35);
+      neckHi = shade(color, 70);
+      neckLo = dark || shade(color, -40);
+    }
+    const boot = "#3a3028";
+
+
+    // ── Tail feathers (layered) ──
+    const tailFeathers = [
+      [-10, 1, -18, -2, -22, 3, -18, 6, -11, 4, deep],
+      [-9, 0, -16, -4, -21, 0, -17, 4, -10, 3, lo],
+      [-8.5, -0.5, -14, -5, -18, -1, -14, 3, -9, 2, mid],
+    ];
+    for (const t of tailFeathers) {
+      ctx.fillStyle = t[10];
+      ctx.beginPath();
+      ctx.moveTo(t[0], t[1]);
+      ctx.bezierCurveTo(t[2], t[3], t[4], t[5], t[6], t[7]);
+      ctx.quadraticCurveTo(t[8], t[9], t[0], t[1]);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // ── Body (rounder ostrich/buzzard torso — soft capsule silhouette) ──
+    // outer silhouette soft edge (puffier arcade oval)
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    ctx.beginPath();
+    ctx.ellipse(0.35, 1.15, 15.2, 10.4, -0.05, 0, Math.PI * 2);
+    ctx.fill();
+
+    // belly (chunkier soft undercarriage)
+    radEll(1.3, 4.1, 13.2, 8.2, belly, lo);
+    // main body mass - puffier soft oval torso
+    const bg = ctx.createRadialGradient(-2.2, -2.4, 1.0, 0.2, 0.9, 16.5);
+    bg.addColorStop(0, hi);
+    bg.addColorStop(0.4, color);
+    bg.addColorStop(1, deep);
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.ellipse(0.15, 0.55, 13.6, 9.0, -0.07, 0, Math.PI * 2);
+    ctx.fill();
+    // chest puff
+    radEll(5.6, 1.05, 7.8, 6.8, hi, mid);
+    // back ridge soft shadow
+    radEll(-6.2, 0.35, 7.6, 6.2, mid, deep);
+
+    // soft feather scallops (rounder arcs)
+    ctx.strokeStyle = "rgba(0,0,0,0.10)";
+    ctx.lineWidth = 0.7;
+    ctx.lineCap = "round";
+    for (let i = 0; i < 6; i++) {
+      ctx.beginPath();
+      ctx.arc(-5.2 + i * 2.15, 2.6 + (i % 2) * 0.7, 2.45, 0.15, Math.PI - 0.15);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(-4.2 + i * 2.6, -3.2);
+      ctx.quadraticCurveTo(-1.8 + i * 2.6, 0.8, -3.0 + i * 2.6, 5.2);
+      ctx.stroke();
+    }
+
+    // ── Long curved neck ──
+    // neck under-shadow tube (pale/white for player ostrich)
+    ctx.strokeStyle = neckLo;
+    ctx.lineWidth = 7.8;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(7.5, 0.5);
+    ctx.bezierCurveTo(12.2, -4.2, 13.8, -11.2, 15.8, -17.0);
+    ctx.stroke();
+    // main neck - long curved pale tube
+    const ng = ctx.createLinearGradient(7, 0, 16, -17);
+    ng.addColorStop(0, neckLo);
+    ng.addColorStop(0.35, neckCol);
+    ng.addColorStop(1, neckHi);
+    ctx.strokeStyle = ng;
+    ctx.lineWidth = 6.2;
+    ctx.beginPath();
+    ctx.moveTo(7.5, 0.15);
+    ctx.bezierCurveTo(12.2, -4.6, 13.8, -11.6, 15.8, -17.2);
+    ctx.stroke();
+    // neck highlight strip
+    ctx.strokeStyle = "rgba(255,255,255,0.42)";
+    ctx.lineWidth = 2.0;
+    ctx.beginPath();
+    ctx.moveTo(8.3, -0.9);
+    ctx.bezierCurveTo(12.4, -5.6, 14.0, -12.1, 16.0, -16.8);
+    ctx.stroke();
+    // neck rings / skin folds
+    ctx.strokeStyle = "rgba(0,0,0,0.14)";
+    ctx.lineWidth = 0.7;
+    for (let i = 0; i < 4; i++) {
+      const t = 0.2 + i * 0.18;
+      const nx = 7.5 + (15.5 - 7.5) * t;
+      const ny = 0.2 + (-16.8 - 0.2) * t - Math.sin(t * Math.PI) * 1.5;
+      ctx.beginPath();
+      ctx.ellipse(nx, ny, 2.6 - i * 0.15, 1.1, -0.6, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // ── Bird head (rounder skull) ──
+    // skull - small round head (arcade compact)
+    radEll(16.8, -17.8, 7.4, 6.2, hi, lo);
+    radEll(16.0, -19.5, 5.0, 3.4, hi, mid);
+    // cheek
+    radEll(17.9, -16.4, 3.9, 3.1, mid, lo);
+    // beak upper mandible
+    const beakG = ctx.createLinearGradient(20, -18, 30, -14);
+    beakG.addColorStop(0, "#ffe868");
+    beakG.addColorStop(0.6, "#f0c020");
+    beakG.addColorStop(1, "#c09010");
+    ctx.fillStyle = beakG;
+    ctx.beginPath();
+    ctx.moveTo(20.5, -18);
+    ctx.bezierCurveTo(25, -18.5, 29, -16.5, 31.5, -15);
+    ctx.quadraticCurveTo(28, -14.2, 21, -14.5);
+    ctx.closePath();
+    ctx.fill();
+    // lower mandible
+    ctx.fillStyle = "#c09818";
+    ctx.beginPath();
+    ctx.moveTo(20.8, -14.6);
+    ctx.quadraticCurveTo(26, -14.2, 29, -13.8);
+    ctx.quadraticCurveTo(25, -12.2, 20.5, -13);
+    ctx.closePath();
+    ctx.fill();
+    // mouth line
+    ctx.strokeStyle = "rgba(80,40,0,0.45)";
+    ctx.lineWidth = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(21, -14.5);
+    ctx.quadraticCurveTo(26, -14, 30, -14.2);
+    ctx.stroke();
+    // nostril
+    ell(23.5, -16.6, 0.7, 0.45, "#6a4810");
+    // eye — detailed
+    radEll(16.2, -18.2, 2.4, 2.3, "#2a2018", "#0a0806");
+    ell(16.5, -18.4, 1.55, 1.5, "#1a3020");
+    ell(16.7, -18.5, 1.0, 1.0, "#0a1008");
+    ell(17.0, -18.8, 0.45, 0.4, "#ffffff");
+    ell(16.3, -17.9, 0.35, 0.25, "rgba(255,255,255,0.25)");
+    // brow ridge
+    ctx.strokeStyle = deep;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(13.5, -19.8);
+    ctx.quadraticCurveTo(16, -21, 18.8, -19.2);
+    ctx.stroke();
+
+    // ── Wing ──
+    if (flap) {
+      // fully raised wing — rounder membrane arc (Pac/DigDug soft silhouette)
+      const wg = ctx.createLinearGradient(-10, 0, 2, -22);
+      wg.addColorStop(0, deep);
+      wg.addColorStop(0.35, lo);
+      wg.addColorStop(0.7, mid);
+      wg.addColorStop(1, hi);
+      ctx.fillStyle = wg;
+      ctx.beginPath();
+      ctx.moveTo(-2.4, 1.3);
+      ctx.bezierCurveTo(-16.5, -2.5, -17.5, -15.5, -5.5, -24.5);
+      ctx.bezierCurveTo(1.5, -27.0, 12.5, -22.0, 11.0, -10.5);
+      ctx.bezierCurveTo(9.5, -3.2, 4.8, 0.6, -2.4, 1.3);
+      ctx.closePath();
+      ctx.fill();
+      // secondary coverts (softer lobe)
+      ctx.fillStyle = "rgba(255,255,255,0.16)";
+      ctx.beginPath();
+      ctx.moveTo(-0.8, -1.5);
+      ctx.bezierCurveTo(-7.5, -8, -6.5, -17, 0.5, -20);
+      ctx.bezierCurveTo(4.5, -17, 5.5, -8, 2.2, -2.5);
+      ctx.closePath();
+      ctx.fill();
+      // primary feather tips — curved, not angular
+      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.lineWidth = 0.8;
+      ctx.lineCap = "round";
+      for (let i = 0; i < 7; i++) {
+        const t = i / 6;
+        ctx.beginPath();
+        ctx.moveTo(-1 + t * 3.2, -1 - t * 2);
+        ctx.quadraticCurveTo(-9 + t * 4.5, -11 - t * 4, -2.5 + t * 5.5, -21 - t * 0.8);
+        ctx.stroke();
+      }
+      // soft leading edge highlight
+      ctx.strokeStyle = "rgba(255,255,255,0.14)";
+      ctx.lineWidth = 1.25;
+      ctx.beginPath();
+      ctx.moveTo(-4.5, -22);
+      ctx.quadraticCurveTo(2.5, -23.5, 9, -13);
+      ctx.stroke();
+    } else if (r.onGround) {
+      // folded wing against body — rounder lobe
+      const fg = ctx.createLinearGradient(-8, 0, 4, 6);
+      fg.addColorStop(0, lo);
+      fg.addColorStop(0.5, mid);
+      fg.addColorStop(1, deep);
+      ctx.fillStyle = fg;
+      ctx.beginPath();
+      ctx.moveTo(-8.5, -0.3);
+      ctx.bezierCurveTo(-12.2, 1.2, -11.5, 8.2, -2.0, 9.4);
+      ctx.bezierCurveTo(4.8, 8.0, 7.2, 3.4, 4.6, 0.2);
+      ctx.bezierCurveTo(1.2, 2.4, -3.4, 2.4, -8.5, -0.3);
+      ctx.closePath();
+      ctx.fill();
+      // folded feather lines
+      ctx.strokeStyle = "rgba(0,0,0,0.16)";
+      ctx.lineWidth = 0.65;
+      for (let i = 0; i < 5; i++) {
+        ctx.beginPath();
+        ctx.moveTo(-6 + i * 1.5, 1);
+        ctx.quadraticCurveTo(-4 + i * 1.4, 4, -2 + i * 1.2, 7);
+        ctx.stroke();
+      }
+      radEll(-1, 4, 4.5, 2.2, mid, deep);
+    } else {
+      // gliding wing out — soft crescent
+      const gg = ctx.createLinearGradient(-4, 0, -2, 12);
+      gg.addColorStop(0, mid);
+      gg.addColorStop(0.5, lo);
+      gg.addColorStop(1, deep);
+      ctx.fillStyle = gg;
+      ctx.beginPath();
+      ctx.moveTo(-3.0, 0.9);
+      ctx.bezierCurveTo(-18.5, 2.2, -18.0, 15.0, -4.0, 15.6);
+      ctx.bezierCurveTo(5.0, 14.0, 9.2, 5.4, 5.6, 0.7);
+      ctx.bezierCurveTo(2.4, 3.4, 0.2, 2.3, -3.0, 0.9);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.lineWidth = 0.7;
+      for (let i = 0; i < 5; i++) {
+        ctx.beginPath();
+        ctx.moveTo(-2 + i * 0.6, 2);
+        ctx.quadraticCurveTo(-8 + i, 7, -3 + i * 1.2, 12);
+        ctx.stroke();
+      }
+      ell(0, 5, 5, 2.2, mid);
+    }
+
+    // ── Legs ──
+    drawBirdLegs(r, walking);
+
+    // ── Saddle & tack ──
+    const saddle = "#6a4530";
+    const leather = "#4a3020";
+    radEll(0.5, -2, 7.2, 3.2, shade(saddle, 40), leather);
+    radEll(0.5, -2.6, 4.5, 1.5, shade(saddle, 60), saddle);
+    // stirrup straps
+    ctx.strokeStyle = leather;
+    ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    ctx.moveTo(-4, -1);
+    ctx.quadraticCurveTo(-5.5, 2, -6, 5);
+    ctx.moveTo(5, -1);
+    ctx.quadraticCurveTo(6.5, 2, 7, 5);
+    ctx.stroke();
+
+    // ── KNIGHT — smaller than mount (classic Joust rider proportion) ──
+    ctx.save();
+    ctx.translate(0.3, -1.2);
+    ctx.scale(0.72, 0.72);
+
+    // armor/plume/boot already resolved from bird type above
+
+    // Seated legs (thighs wrap saddle, shins hang)
+    // left thigh + shin
+    ctx.strokeStyle = armorDk;
+    ctx.lineWidth = 4.0;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(-1.5, -5);
+    ctx.quadraticCurveTo(-4, -1, -5.5, 3.5);
+    ctx.stroke();
+    ctx.strokeStyle = armorMid;
+    ctx.lineWidth = 3.0;
+    ctx.beginPath();
+    ctx.moveTo(-1.5, -5);
+    ctx.quadraticCurveTo(-3.8, -1, -5.3, 3.3);
+    ctx.stroke();
+    // right
+    ctx.strokeStyle = armorDk;
+    ctx.lineWidth = 4.0;
+    ctx.beginPath();
+    ctx.moveTo(2.5, -5);
+    ctx.quadraticCurveTo(5, -1, 6.5, 3.5);
+    ctx.stroke();
+    ctx.strokeStyle = armorMid;
+    ctx.lineWidth = 3.0;
+    ctx.beginPath();
+    ctx.moveTo(2.5, -5);
+    ctx.quadraticCurveTo(4.8, -1, 6.3, 3.3);
+    ctx.stroke();
+    // greaves / boots
+    radEll(-5.8, 4.8, 3.2, 2.2, "#5a5048", boot);
+    radEll(6.8, 4.8, 3.2, 2.2, "#5a5048", boot);
+    ell(-6.2, 4.2, 1.4, 0.7, "#8a8070");
+    ell(6.4, 4.2, 1.4, 0.7, "#8a8070");
+    // boot toe
+    ell(-7.5, 5.2, 1.5, 1.0, boot);
+    ell(8.0, 5.2, 1.5, 1.0, boot);
+
+    // Torso breastplate — rounder capsule human silhouette
+    const tg = ctx.createLinearGradient(-6, -18, 6, -4);
+    tg.addColorStop(0, "#ffffff");
+    tg.addColorStop(0.3, armor);
+    tg.addColorStop(0.7, armorMid);
+    tg.addColorStop(1, armorDk);
+    ctx.fillStyle = tg;
+    ctx.beginPath();
+    ctx.moveTo(-4.6, -6.2);
+    ctx.bezierCurveTo(-6.2, -8.5, -7.2, -12.2, -6.4, -15);
+    ctx.quadraticCurveTo(-5.8, -17.2, -3.6, -18.2);
+    ctx.quadraticCurveTo(0.2, -19.8, 4.0, -18.2);
+    ctx.quadraticCurveTo(6.2, -17.2, 6.8, -15);
+    ctx.bezierCurveTo(7.4, -12.2, 6.4, -8.5, 4.8, -6.2);
+    ctx.quadraticCurveTo(2.4, -4.6, 0.2, -4.6);
+    ctx.quadraticCurveTo(-2.0, -4.6, -4.6, -6.2);
+    ctx.closePath();
+    ctx.fill();
+    // soft armor edge
+    softStroke(() => {
+      ctx.moveTo(-4.6, -6.2);
+      ctx.bezierCurveTo(-6.2, -8.5, -7.2, -12.2, -6.4, -15);
+      ctx.quadraticCurveTo(-5.8, -17.2, -3.6, -18.2);
+      ctx.quadraticCurveTo(0.2, -19.8, 4.0, -18.2);
+      ctx.quadraticCurveTo(6.2, -17.2, 6.8, -15);
+      ctx.bezierCurveTo(7.4, -12.2, 6.4, -8.5, 4.8, -6.2);
+    }, 0.9, "rgba(0,0,0,0.18)");
+    // chest plate ridge + rivets
+    ctx.strokeStyle = "rgba(255,255,255,0.45)";
+    ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    ctx.moveTo(0.2, -16.5);
+    ctx.lineTo(0.2, -7);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(0,0,0,0.12)";
+    ctx.lineWidth = 0.7;
+    ctx.beginPath();
+    ctx.moveTo(-3, -14);
+    ctx.quadraticCurveTo(0, -13, 3.2, -14);
+    ctx.stroke();
+    for (const [rx, ry] of [
+      [-3.5, -12],
+      [3.8, -12],
+      [-3.2, -9],
+      [3.5, -9],
+    ]) {
+      ell(rx, ry, 0.55, 0.55, steel);
+      ell(rx - 0.15, ry - 0.15, 0.22, 0.22, "#fff");
+    }
+    // belt + buckle
+    roundedBand(-5.2, -7.2, 10.8, 2.2, leather);
+    radEll(0.2, -6.1, 1.7, 1.3, C.yellow, "#a88010");
+    ell(0.2, -6.2, 0.7, 0.5, "#fff4a0");
+
+    // Pauldrons (rounder shoulder caps)
+    radEll(-6.0, -13.6, 3.4, 3.6, armor, armorDk);
+    radEll(6.2, -13.6, 3.4, 3.6, armor, armorDk);
+    ell(-6.4, -14.7, 1.5, 1.1, "rgba(255,255,255,0.38)");
+    ell(6.0, -14.7, 1.5, 1.1, "rgba(255,255,255,0.38)");
+
+    // Back arm (reins)
+    ctx.strokeStyle = armorDk;
+    ctx.lineWidth = 3.4;
+    ctx.beginPath();
+    ctx.moveTo(-5.5, -12.5);
+    ctx.quadraticCurveTo(-9, -11, -10.5, -6.5);
+    ctx.stroke();
+    ctx.strokeStyle = armorMid;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(-5.5, -12.5);
+    ctx.quadraticCurveTo(-8.8, -11, -10.2, -6.8);
+    ctx.stroke();
+    radEll(-10.5, -6.2, 2.1, 2.0, armor, armorDk);
+
+    // Forward arm holding lance
+    ctx.strokeStyle = armorDk;
+    ctx.lineWidth = 3.4;
+    ctx.beginPath();
+    ctx.moveTo(5.5, -13.5);
+    ctx.quadraticCurveTo(9.5, -13, 12, -12);
+    ctx.stroke();
+    ctx.strokeStyle = armorMid;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(5.5, -13.5);
+    ctx.quadraticCurveTo(9.3, -13, 11.8, -12.1);
+    ctx.stroke();
+    // gauntlet
+    radEll(12.5, -12, 2.6, 2.2, armor, armorDk);
+    ell(12.8, -12.4, 1.0, 0.7, "rgba(255,255,255,0.3)");
+
+    // ── Helmet (rounder dome — less blocky) ──
+    // neck gorget
+    radEll(0.4, -18.0, 2.6, 2.0, armorMid, armorDk);
+    // dome - rounder helmet bubble (arcade knight)
+    const hg = ctx.createRadialGradient(-1.4, -23.0, 0.5, 0.5, -21.0, 8.2);
+    hg.addColorStop(0, "#ffffff");
+    hg.addColorStop(0.35, armor);
+    hg.addColorStop(1, armorDk);
+    ctx.fillStyle = hg;
+    ctx.beginPath();
+    ctx.ellipse(0.5, -21.4, 5.7, 6.2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // helmet crest ridge
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(0.5, -25.5);
+    ctx.quadraticCurveTo(0.8, -22, 0.5, -18.5);
+    ctx.stroke();
+    // brim
+    const brimG = ctx.createLinearGradient(-5, -18, 5, -17);
+    brimG.addColorStop(0, armorDk);
+    brimG.addColorStop(0.5, steel);
+    brimG.addColorStop(1, armorDk);
+    ctx.fillStyle = brimG;
+    ctx.beginPath();
+    ctx.ellipse(0.5, -18.2, 5.9, 2.05, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // faceplate
+    radEll(1.4, -19.8, 2.8, 3.0, armorMid, armorDk);
+    // T-visor (rounded, not pixel rect)
+    ctx.fillStyle = "#0c0e14";
+    ctx.beginPath();
+    ctx.moveTo(-1.0, -20.6);
+    ctx.lineTo(3.4, -20.6);
+    ctx.quadraticCurveTo(3.8, -20.6, 3.8, -20.1);
+    ctx.lineTo(3.8, -19.2);
+    ctx.quadraticCurveTo(3.8, -18.7, 3.4, -18.7);
+    ctx.lineTo(1.6, -18.7);
+    ctx.lineTo(1.6, -17.6);
+    ctx.quadraticCurveTo(1.6, -17.2, 1.1, -17.2);
+    ctx.lineTo(0.3, -17.2);
+    ctx.quadraticCurveTo(-0.2, -17.2, -0.2, -17.6);
+    ctx.lineTo(-0.2, -18.7);
+    ctx.lineTo(-1.0, -18.7);
+    ctx.quadraticCurveTo(-1.4, -18.7, -1.4, -19.2);
+    ctx.lineTo(-1.4, -20.1);
+    ctx.quadraticCurveTo(-1.4, -20.6, -1.0, -20.6);
+    ctx.closePath();
+    ctx.fill();
+    // visor glint
+    ctx.strokeStyle = "rgba(120,140,180,0.55)";
+    ctx.lineWidth = 0.55;
+    ctx.beginPath();
+    ctx.moveTo(-0.6, -20.2);
+    ctx.lineTo(3.2, -20.2);
+    ctx.stroke();
+    // cheek guards
+    radEll(-3.0, -19.2, 1.7, 2.4, armor, armorDk);
+    radEll(4.2, -19.2, 1.7, 2.4, armor, armorDk);
+
+    // Plume (team accent)
+    const plume = plumeCol;
+    const pg = ctx.createLinearGradient(0, -24, 2, -34);
+    pg.addColorStop(0, shade(plume, -30));
+    pg.addColorStop(0.4, plume);
+    pg.addColorStop(1, shade(plume, 50));
+    ctx.fillStyle = pg;
+    ctx.beginPath();
+    ctx.moveTo(-0.2, -25);
+    ctx.bezierCurveTo(-3.5, -28, -2.5, -33, 1.2, -35);
+    ctx.bezierCurveTo(4.5, -33, 4, -28, 2.2, -25);
+    ctx.quadraticCurveTo(1, -24.5, -0.2, -25);
+    ctx.closePath();
+    ctx.fill();
+    // plume strands
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 0.7;
+    ctx.beginPath();
+    ctx.moveTo(0.5, -26);
+    ctx.quadraticCurveTo(1, -30, 1.5, -34);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(0,0,0,0.15)";
+    ctx.beginPath();
+    ctx.moveTo(1.8, -26);
+    ctx.quadraticCurveTo(2.5, -30, 2, -33.5);
+    ctx.stroke();
+
+    // ── Lance (polished metal shaft) ──
+    const lg = ctx.createLinearGradient(10, -12, 38, -14);
+    lg.addColorStop(0, "#707888");
+    lg.addColorStop(0.25, "#e8ecf4");
+    lg.addColorStop(0.5, "#b8c0d0");
+    lg.addColorStop(0.8, "#d0d8e8");
+    lg.addColorStop(1, "#606878");
+    ctx.strokeStyle = "#404858";
+    ctx.lineWidth = 3.2;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(10, -12);
+    ctx.lineTo(34, -13.5);
+    ctx.stroke();
+    ctx.strokeStyle = lg;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(10, -12);
+    ctx.lineTo(34, -13.5);
+    ctx.stroke();
+    // rounder silver lance tip (soft teardrop, not sharp triangle)
+    const tipG = ctx.createLinearGradient(33, -15, 41, -12);
+    tipG.addColorStop(0, "#ffffff");
+    tipG.addColorStop(0.35, "#e8ecf4");
+    tipG.addColorStop(0.7, "#b8c0d0");
+    tipG.addColorStop(1, "#707888");
+    ctx.fillStyle = tipG;
+    ctx.beginPath();
+    ctx.moveTo(32.2, -15.0);
+    ctx.quadraticCurveTo(36.5, -15.6, 40.5, -13.5);
+    ctx.quadraticCurveTo(36.5, -11.4, 32.2, -12.0);
+    ctx.closePath();
+    ctx.fill();
+    radEll(36.5, -13.5, 2.2, 1.35, "#ffffff", "#a0a8b8");
+    // grip wrap
+    roundedBand(10, -13.4, 3.4, 2.8, leather);
+    radEll(12.5, -12, 1.7, 1.5, armor, armorDk);
+
+    ctx.restore(); // end knight scale
+    ctx.restore(); // end rider
+  }
+
+
+  function drawEgg(egg) {
+    // Soft Williams green egg - rounder Pac-hybrid silhouette (visual only; physics = V15)
+    ctx.fillStyle = "rgba(0,0,0,0.24)";
+    ctx.beginPath();
+    ctx.ellipse(egg.x + 0.3, egg.y + 1.4, 6.2, 2.3, 0, 0, Math.PI * 2);
+    ctx.fill();
+    const g = ctx.createRadialGradient(egg.x - 1.6, egg.y - 2.6, 0.6, egg.x, egg.y, 8.2);
+    g.addColorStop(0, "#b8ffb0");
+    g.addColorStop(0.4, C.egg);
+    g.addColorStop(1, "#104010");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(egg.x, egg.y, 6.2, 7.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // soft outer rim glow
+    ctx.strokeStyle = "rgba(180,255,160,0.28)";
+    ctx.lineWidth = 1.35;
+    ctx.beginPath();
+    ctx.ellipse(egg.x, egg.y, 6.0, 7.15, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    // glossy highlight arc
+    ctx.strokeStyle = "rgba(255,255,255,0.5)";
+    ctx.lineWidth = 1.35;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.ellipse(egg.x - 1.4, egg.y - 2.5, 2.7, 3.1, -0.45, 0.12, Math.PI * 0.95);
+    ctx.stroke();
+    // tiny specular dot
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.beginPath();
+    ctx.ellipse(egg.x - 1.8, egg.y - 3.0, 1.1, 0.85, -0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+
+  /**
+   * HD pterodactyl — same vector style as knights/birds.
+   * Tan leathery body, long snout with openable jaws, broad flapping wings.
+   * Sized near original arcade scale (slightly larger than a mounted knight).
+   */
+  function drawOnePtero(pt) {
+    if (!pt || !pt.alive) return;
+    const flapT = Math.sin(pt.frame / 95);
+    const wingUp = flapT > 0;
+    const wingAmt = Math.abs(flapT);
+    const open = pteroMouthOpen(pt);
+    const jaw = open ? 1 : 0.15 + 0.2 * Math.max(0, Math.sin(pt.mouthPhase));
+    // Match rider playfield scale (~0.69 family) but a bit bigger like original ptero
+    const s = 0.92;
+
+    ctx.save();
+    ctx.translate(pt.x, pt.y);
+    ctx.scale((pt.vx >= 0 ? 1 : -1) * s, s);
+
+    // Soft flight shadow
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.beginPath();
+    ctx.ellipse(0, 10, 16, 2.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    const skinHi = "#e8c8a0";
+    const skin = "#c9a078";
+    const skinLo = "#8a6048";
+    const skinDeep = "#5a3828";
+    const membrane = "#a87858";
+    const membraneLo = "#6a4430";
+    const membraneHi = "#c89870";
+
+    // ── Tail ──
+    ctx.fillStyle = skinLo;
+    ctx.beginPath();
+    ctx.moveTo(-12, 1);
+    ctx.bezierCurveTo(-18, -1, -24, 2, -26, 5);
+    ctx.quadraticCurveTo(-20, 4, -14, 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = skinDeep;
+    ctx.beginPath();
+    ctx.moveTo(-12, 2);
+    ctx.bezierCurveTo(-17, 4, -22, 7, -24, 8);
+    ctx.quadraticCurveTo(-18, 5, -13, 3);
+    ctx.closePath();
+    ctx.fill();
+
+    // ── Far wing (draw first, behind body) ──
+    drawPteroWing(-1, wingUp, wingAmt, membrane, membraneLo, membraneHi, true);
+
+    // ── Body ──
+    const bg = ctx.createRadialGradient(-2, -2, 1, 0, 1, 16);
+    bg.addColorStop(0, skinHi);
+    bg.addColorStop(0.45, skin);
+    bg.addColorStop(1, skinDeep);
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.ellipse(0, 0.5, 14.4, 6.5, -0.07, 0, Math.PI * 2);
+    ctx.fill();
+    // belly
+    radEll(2, 2.2, 8, 3.2, shade(skinHi, 20), skinLo);
+    // neck
+    ctx.strokeStyle = skin;
+    ctx.lineWidth = 5.5;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(9, 0);
+    ctx.bezierCurveTo(13, -1, 15, -2.5, 17, -2);
+    ctx.stroke();
+    ctx.strokeStyle = skinHi;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(9.5, -0.8);
+    ctx.bezierCurveTo(13, -1.8, 15, -3, 17, -2.5);
+    ctx.stroke();
+
+    // ── Head + crest ──
+    radEll(18, -2.2, 6.2, 4.2, skinHi, skinLo);
+    // head crest (original has a small ridge)
+    ctx.fillStyle = skinLo;
+    ctx.beginPath();
+    ctx.moveTo(14, -5);
+    ctx.bezierCurveTo(15, -9, 18, -11, 20, -9);
+    ctx.quadraticCurveTo(18, -6, 16, -4.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = skinHi;
+    ctx.beginPath();
+    ctx.moveTo(15, -5.5);
+    ctx.bezierCurveTo(16, -8, 18, -9, 19.5, -7.5);
+    ctx.quadraticCurveTo(17.5, -6, 16, -5);
+    ctx.closePath();
+    ctx.fill();
+    // eye
+    radEll(17.5, -3.2, 1.6, 1.5, "#2a1810", "#0a0604");
+    ell(17.8, -3.4, 0.7, 0.65, "#101008");
+    ell(18.1, -3.6, 0.3, 0.28, "#fff");
+
+    // ── Jaws (openable — kill target) ──
+    // upper snout
+    const jawG = ctx.createLinearGradient(20, -4, 36, 0);
+    jawG.addColorStop(0, skinHi);
+    jawG.addColorStop(0.5, skin);
+    jawG.addColorStop(1, skinLo);
+    ctx.fillStyle = jawG;
+    ctx.beginPath();
+    ctx.moveTo(20, -3.6);
+    ctx.bezierCurveTo(26.5, -5.4, 33, -3.8, 37.5, -1.4);
+    ctx.quadraticCurveTo(32.5, -0.3, 22, -0.15);
+    ctx.closePath();
+    ctx.fill();
+    // lower jaw swings with open amount
+    ctx.save();
+    ctx.translate(21, 0);
+    ctx.rotate(jaw * 0.38);
+    ctx.fillStyle = shade(skin, -25);
+    ctx.beginPath();
+    ctx.moveTo(0, 0.2);
+    ctx.bezierCurveTo(6, 1.5, 12, 2.2, 15.5, 1.8);
+    ctx.quadraticCurveTo(10, 3.5, 2, 2.2);
+    ctx.closePath();
+    ctx.fill();
+    // teeth when open
+    if (open) {
+      ctx.fillStyle = "#f0e8d8";
+      for (let i = 0; i < 4; i++) {
+        ctx.beginPath();
+        ctx.moveTo(3 + i * 3, 0.4);
+        ctx.lineTo(4 + i * 3, 1.6);
+        ctx.lineTo(5 + i * 3, 0.4);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+    // mouth cavity / dark maw (spear target glow when open)
+    if (open) {
+      ctx.fillStyle = "#2a1010";
+      ctx.beginPath();
+      ctx.moveTo(22, -0.8);
+      ctx.quadraticCurveTo(28, -0.2, 33, -0.6);
+      ctx.quadraticCurveTo(28, 1.2, 22, 0.8);
+      ctx.closePath();
+      ctx.fill();
+      // subtle kill-zone hint
+      ctx.fillStyle = "rgba(255,80,40,0.22)";
+      ctx.beginPath();
+      ctx.ellipse(30, 0, 4.5, 2.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = "rgba(60,30,20,0.5)";
+      ctx.lineWidth = 0.7;
+      ctx.beginPath();
+      ctx.moveTo(22, -0.3);
+      ctx.quadraticCurveTo(28, 0, 34, -0.8);
+      ctx.stroke();
+    }
+    // nostril
+    ell(24, -2.8, 0.7, 0.45, skinDeep);
+
+    // ── Near wing (in front) ──
+    drawPteroWing(1, wingUp, wingAmt, membrane, membraneLo, membraneHi, false);
+
+    // ── Legs tucked ──
+    ctx.strokeStyle = skinLo;
+    ctx.lineWidth = 1.6;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(-2, 4);
+    ctx.quadraticCurveTo(-4, 7, -5, 9);
+    ctx.moveTo(3, 4);
+    ctx.quadraticCurveTo(5, 7, 6, 9);
+    ctx.stroke();
+    ell(-5, 9, 1.2, 0.8, skin);
+    ell(6, 9, 1.2, 0.8, skin);
+
+    ctx.restore();
+  }
+
+  function drawPteroWing(side, wingUp, wingAmt, membrane, membraneLo, membraneHi, far) {
+    // side: -1 left/back-ish relative, +1 forward wing in facing space
+    ctx.save();
+    const rootX = far ? -2 : 2;
+    const rootY = far ? -0.5 : 0.5;
+    ctx.translate(rootX, rootY);
+    // flap angle
+    const ang = wingUp ? -0.55 - wingAmt * 0.45 : 0.35 + wingAmt * 0.55;
+    ctx.rotate(ang * (far ? 0.85 : 1));
+    if (far) ctx.scale(0.92, 0.92);
+
+    const wg = ctx.createLinearGradient(0, 0, -2, wingUp ? -18 : 16);
+    wg.addColorStop(0, membraneHi);
+    wg.addColorStop(0.4, membrane);
+    wg.addColorStop(1, membraneLo);
+    ctx.fillStyle = wg;
+    ctx.beginPath();
+    // smoother leathery membrane — still readable pterosaur shape
+    ctx.moveTo(0, 0);
+    if (wingUp) {
+      ctx.bezierCurveTo(-10, -3.2, -19.5, -11.5, -7.5, -23.0);
+      ctx.bezierCurveTo(2.0, -21.5, 12.5, -13.5, 9.8, -4.2);
+      ctx.bezierCurveTo(7.0, -1.4, 3.2, 0.25, 0, 0);
+    } else {
+      ctx.bezierCurveTo(-12, 2.2, -21.0, 11.5, -9.0, 20.5);
+      ctx.bezierCurveTo(0.8, 18.5, 12.0, 11.5, 9.2, 3.4);
+      ctx.bezierCurveTo(5.8, 1.2, 2.3, 0.25, 0, 0);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // wing finger bones (pterosaur look)
+    ctx.strokeStyle = "rgba(40,20,10,0.35)";
+    ctx.lineWidth = 0.9;
+    ctx.lineCap = "round";
+    const tips = wingUp
+      ? [
+          [-4, -18],
+          [-1, -17],
+          [3, -14],
+          [6, -10],
+        ]
+      : [
+          [-5, 16],
+          [-1, 15],
+          [3, 12],
+          [6, 8],
+        ];
+    for (const [tx, ty] of tips) {
+      ctx.beginPath();
+      ctx.moveTo(1, 0);
+      ctx.quadraticCurveTo(tx * 0.4, ty * 0.35, tx, ty);
+      ctx.stroke();
+    }
+    // membrane highlight
+    ctx.strokeStyle = "rgba(255,220,180,0.12)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(2, -1);
+    ctx.quadraticCurveTo(-4, wingUp ? -10 : 8, tips[1][0], tips[1][1]);
+    ctx.stroke();
+
+    // arm/hand claw at wing tip joint
+    ell(wingUp ? -5 : -6, wingUp ? -19 : 17, 1.4, 1.1, membraneHi);
+
+    ctx.restore();
+  }
+
+  function drawPtero() {
+    for (const pt of pteros) drawOnePtero(pt);
+  }
+
+  function drawHands() {
+    for (const h of hands) {
+      const g = ctx.createRadialGradient(h.x, h.y, 2, h.x, h.y, 14);
+      g.addColorStop(0, "#ff9060");
+      g.addColorStop(1, "#a03018");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.ellipse(h.x, h.y, 8, 10, 0, 0, Math.PI * 2);
+      ctx.fill();
+      for (let i = -2; i <= 2; i++) {
+        ell(h.x + i * 3.8, h.y - 11 - Math.abs(i) * 0.5, 1.8, 5, "#e07050");
+        ell(h.x + i * 3.8, h.y - 15 - Math.abs(i), 1.3, 1.5, "#ffb080");
+      }
+    }
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      ctx.globalAlpha = clamp(p.life / 400, 0, 1);
+      oval(p.x, p.y, (p.size || 2) * 0.55, (p.size || 2) * 0.55, p.color);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMessages() {
+    if (messageT > 0 && message) {
+      ctx.fillStyle = C.yellow;
+      ctx.font = '11px "Press Start 2P", monospace';
+      ctx.textAlign = "center";
+      ctx.fillText(message, VW / 2, VH * 0.36);
+    }
+  }
+
+  function render() {
+    // Draw in logical space at SCALE× resolution for smooth HD look
+    ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    try {
+      ctx.imageSmoothingQuality = "high";
+    } catch (_) {}
+    drawBackground();
+    drawLava();
+    drawPlatforms();
+    drawHands();
+    for (const egg of eggs) if (!egg.dead) drawEgg(egg);
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      if (e.type === "hunter") drawRider(e, C.hunter, C.hunterDk, C.hunterWing);
+      else if (e.type === "shadow") drawRider(e, C.shadow, C.shadowDk, C.shadowWing);
+      else drawRider(e, C.bounder, C.bounderDk, C.bounderWing);
+    }
+    if (player && player.alive) {
+      if (!(invuln > 0 && ((invuln / 70) | 0) % 2 === 0)) {
+        drawRider(player, C.player, C.playerDk, C.playerWing);
+      }
+    }
+    drawPtero();
+    drawParticles();
+    drawMessages();
+    if (state === "attract" && ((lavaAnim / 480) | 0) % 2 === 0) {
+      ctx.fillStyle = "#ff3030";
+      ctx.font = '12px "Press Start 2P", monospace';
+      ctx.textAlign = "center";
+      ctx.fillText("INSERT COIN", VW / 2, 28);
+    }
+  }
+
+
+  // ── Loop ─────────────────────────────────────────────────────────────────
+  let last = 0;
+  function tick(ts) {
+    if (!last) last = ts;
+    let dt = ts - last;
+    last = ts;
+    if (dt > 50) dt = 50;
+    try {
+      update(dt);
+      render();
+    } catch (err) {
+      console.error(err);
+      showOV("ERROR", String(err.message || err).slice(0, 40), "RELOAD");
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // ── Input ────────────────────────────────────────────────────────────────
+  async function startOrFlap() {
+    await unlockAudio();
+    if (state === "title" || state === "over" || state === "attract") beginGame();
+    else if (state === "pause") {
+      state = "play";
+      hideOV();
+    } else if (state === "play") {
+      flapPulse = true;
+    }
+  }
+
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      keys[e.code] = true;
+      keys[e.key] = true;
+      if (["ArrowLeft", "ArrowRight", " ", "ArrowUp"].includes(e.key)) e.preventDefault();
+      unlockAudio();
+      if (e.key === "m" || e.key === "M") {
+        muted = !muted;
+        return;
+      }
+      if (e.key === "p" || e.key === "P" || e.key === "Escape") {
+        if (state === "play") {
+          state = "pause";
+          showOV("PAUSED", "PRESS P OR FLAP", "");
+        } else if (state === "pause") {
+          state = "play";
+          hideOV();
+        }
+        return;
+      }
+      if (e.code === "Space" || e.key === " " || e.key === "ArrowUp" || e.key === "w" || e.key === "W") {
+        e.preventDefault();
+        startOrFlap();
+        flapHeld = true;
+      }
+      if (
+        state === "title" ||
+        state === "attract" ||
+        state === "over"
+      ) {
+        if (["ArrowLeft", "ArrowRight", "a", "A", "d", "D"].includes(e.key)) beginGame();
+      }
+    },
+    { passive: false }
+  );
+  window.addEventListener("keyup", (e) => {
+    keys[e.code] = false;
+    keys[e.key] = false;
+    if (e.code === "Space" || e.key === " " || e.key === "ArrowUp") flapHeld = false;
+  });
+
+  function bindBtn(id, down, up) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const d = (ev) => {
+      ev.preventDefault();
+      unlockAudio();
+      down();
+    };
+    const u = (ev) => {
+      ev.preventDefault();
+      if (up) up();
+    };
+    el.addEventListener("pointerdown", d);
+    el.addEventListener("pointerup", u);
+    el.addEventListener("pointerleave", u);
+    el.addEventListener("pointercancel", u);
+  }
+
+  bindBtn(
+    "btn-left",
+    () => {
+      if (state === "title" || state === "attract" || state === "over") beginGame();
+      leftHeld = true;
+    },
+    () => (leftHeld = false)
+  );
+  bindBtn(
+    "btn-right",
+    () => {
+      if (state === "title" || state === "attract" || state === "over") beginGame();
+      rightHeld = true;
+    },
+    () => (rightHeld = false)
+  );
+  bindBtn(
+    "btn-flap",
+    () => {
+      flapHeld = true;
+      startOrFlap();
+    },
+    () => {
+      flapHeld = false;
+    }
+  );
+  bindBtn(
+    "btn-pause",
+    () => {
+      if (state === "play") {
+        state = "pause";
+        showOV("PAUSED", "TAP FLAP TO RESUME", "");
+      } else if (state === "pause") {
+        state = "play";
+        hideOV();
+      } else if (state === "title" || state === "over" || state === "attract") beginGame();
+    },
+    () => {}
+  );
+  bindBtn(
+    "btn-mute",
+    () => {
+      muted = !muted;
+    },
+    () => {}
+  );
+
+  // Tap canvas to flap / start
+  canvas.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    startOrFlap();
+  });
+
+  if (overlay) {
+    overlay.addEventListener("click", () => startOrFlap());
+  }
+
+  // Resize canvas CSS is handle by CSS object-fit; logical size fixed
+  hud();
+  if ($high) $high.textContent = pad(high);
+  titleT = 4200;
+  showOV("JOUST", "INSERT COIN", "BUILD V18 — INSERT COIN — PRESS SPACE / FLAP");
+})();
