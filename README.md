@@ -1,56 +1,24 @@
-# JOUST — Williams 1982 Style
+# JOUST — Williams 1982 web recreation
 
-Browser recreation of **Williams Electronics’ Joust** (1982), companion to:
+**Live:** https://bamtec70.github.io/joust-game/ · part of the [WTP Arcade](https://wethepeoplepress.com/games/)
 
-- [PAC-MAN](https://bamtec70.github.io/pacman-game/)
-- [MS. PAC-MAN](https://bamtec70.github.io/ms-pacman-game/)
-- [DIG DUG](https://bamtec70.github.io/dig-dug-game/)
-- [DEFENDER](https://bamtec70.github.io/defender-game/)
-- [GALAGA](https://bamtec70.github.io/galaga-game/)
-
-## Play
-
-**Live:** https://bamtec70.github.io/joust-game/
-
-You should see **BUILD V11** on the title screen. If nobody is playing, the cabinet runs an **attract demo**, then loops back to INSERT COIN. Space, flap, or tap starts a real game.
-
-```powershell
-cd C:\Users\bamte\joust
-python -m http.server 8766
-```
-
-**Landscape / horizontal** playfield fills the screen. Rotate phones sideways for best play.
-
-## Mission
-
-Mount your **ostrich**, flap into the air, and unseat enemy knights by striking **from above**. Collect **eggs** before they hatch. Avoid **lava** and the **pterodactyl**.
+Native 292×240 playfield (cabinet resolution), pixel-scaled. Every sprite is hand-authored pixel data in `game.js` and every sound is synthesized with the Web Audio API. No ROM data, samples or extracted images are included.
 
 ## Controls
-
 | Input | Action |
-|-------|--------|
-| **← → / A D** | Face / accelerate left-right |
-| **Space / ↑ / W** | Flap wings |
-| **FLAP** (touch) | Flap |
-| **◀ ▶** (touch) | Direction |
-| **P** | Pause |
-| **M** | Mute |
+|---|---|
+| ← → / A D | Run / steer |
+| Space / Ctrl / ↑ / W | Flap (one flap per press) |
+| 5 | Insert coin |
+| Enter / 1 | Start (Enter also coins if no credits) |
+| 2 | Two-player start (P2 stork: J / L move, I flap) |
+| P / M | Pause / sound |
+| Touch | Hold ◀ ▶ to run, tap anywhere else to flap (multi-touch); tap to coin/start |
 
-## Scoring (approx.)
+## Game
+Bounder 500 · Hunter 750 · Shadow Lord 1500 · Eggs 250/500/750/1000 (+500 caught mid-air) · Pterodactyl 1000 (lance into the open mouth) · extra mount every 20,000.
+Wave cycle: regular, Survival (3000 if you don't die), Team (2P, 3000), Gladiator (3000 for first unseating), Egg wave every 5th. Bridges burn at wave 3, the lava troll grabs from wave 3, and ledges vanish on later waves.
 
-| Target | Points |
-|--------|--------|
-| Bounder | 500 |
-| Hunter | 750 |
-| Shadow Lord | 1500 |
-| Egg | 250 |
-| Pterodactyl | 1000 |
-
-Extra mount every **20,000**.
-
-## Files
-
-- `index.html` / `joust-v11.css` / `joust-v11.js`
-- `sfx/` — original Williams cabinet samples (16-bit PCM for the browser)
+Debug: `?wave=N` starts directly at wave N (`&players=2` for two players); with it, the backquote key skips a wave.
 
 Fan recreation for personal / educational use. Not affiliated with Williams or its successors.
