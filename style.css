@@ -1,5 +1,5 @@
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:#000;overflow:hidden;overscroll-behavior:none}
+html,body{height:100%;background:#000;overflow:hidden;overscroll-behavior:none;position:fixed;inset:0}
 body{color:#fff;font-family:"Courier New",monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
 #topbar{width:min(100vw - 12px,876px,(100dvh - 60px)*292/240);display:flex;justify-content:space-between;align-items:center;position:relative;z-index:5}
 #back-link{color:#fff;text-decoration:none;font-size:13px;letter-spacing:2px;border:1px solid #fff;padding:5px 9px}
@@ -9,19 +9,25 @@ body{color:#fff;font-family:"Courier New",monospace;display:flex;flex-direction:
 #canvas-wrap{line-height:0;border:1px solid #333}
 #game{display:block;background:#000;width:min(100vw - 12px,876px,(100dvh - 60px)*292/240);height:auto;aspect-ratio:292/240;image-rendering:pixelated;image-rendering:crisp-edges;touch-action:none}
 #help{font-size:11px;color:#aaa;letter-spacing:1px;text-align:center;padding:0 6px}
-#touch-pad,#touch-help,#rotate-hint{display:none}
+#touch-pad,#flap-pad,#touch-help,#rotate-hint{display:none}
 .tbtn{width:84px;height:84px;border-radius:50%;border:2px solid rgba(255,255,255,.7);background:rgba(255,255,255,.08);color:#fff;font:inherit;font-size:30px;font-weight:bold;touch-action:none;line-height:1}
 .tbtn.active{background:rgba(255,255,255,.4)}
 body.touch #help{display:none}
 body.touch #touch-help{display:block;font-size:11px;color:#aaa;letter-spacing:1px;text-align:center}
-body.touch #touch-pad{display:flex;gap:14px;position:absolute;left:10px;bottom:10px;z-index:4;line-height:1}
-body.touch #game{width:min(100vw - 12px,(100dvh - 70px)*292/240)}
-body.touch #topbar{width:min(100vw - 12px,(100dvh - 70px)*292/240)}
+body.touch .pad{display:flex;gap:14px;position:fixed;z-index:6;bottom:max(14px,env(safe-area-inset-bottom));line-height:1}
+body.touch #touch-pad{display:flex;left:max(10px,env(safe-area-inset-left))}
+body.touch #flap-pad{display:flex;right:max(10px,env(safe-area-inset-right))}
+#btn-flap{width:108px;height:108px;border-radius:50%;border:2px solid rgba(255,60,60,.85);background:rgba(255,40,40,.15);color:#fff;font:inherit;font-size:20px;font-weight:bold;touch-action:none}
+#btn-flap.active{background:rgba(255,80,80,.5)}
+body.touch #game,body.touch #topbar{width:min(100vw - 12px,(100dvh - 50px)*292/240)}
+@media (orientation:landscape){
+  body.touch #game,body.touch #topbar{width:min(100vw - 2*max(200px,env(safe-area-inset-left)) - 8px,(100dvh - 44px)*292/240)}
+  body.touch #touch-help{display:none}
+}
 @media (orientation:portrait){
+  body.touch{justify-content:flex-start;padding-top:8px}
   body.touch #rotate-hint{display:block;color:#ff0;font-size:13px;letter-spacing:2px;animation:blink 1.2s steps(2) infinite}
   body.touch #game,body.touch #topbar{width:calc(100vw - 8px)}
-  body.touch #stage{display:flex;flex-direction:column;align-items:flex-start;gap:14px}
-  body.touch #touch-pad{position:static;padding-left:10px}
-  .tbtn{width:96px;height:96px}
+  .tbtn{width:92px;height:92px}
 }
 @keyframes blink{50%{opacity:.3}}

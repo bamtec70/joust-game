@@ -219,12 +219,14 @@ function buildBase() {
   return c;
 }
 /* ---------------- audio (Web Audio synthesis) ---------------- */
-let AC = null, master = null, muted = localStorage.getItem("joust_mute") === "1";
+localStorage.removeItem("joust_mute"); /* build 31: legacy key could be stuck on; sound is ON by default */
+let AC = null, master = null, muted = localStorage.getItem("joust_mute_v31") === "1";
 function audio() {
   if (!AC) {
     try { AC = new (window.AudioContext || window.webkitAudioContext)(); master = AC.createGain(); master.gain.value = muted ? 0 : 0.35; master.connect(AC.destination); } catch (e) { AC = null; }
   }
-  if (AC && AC.state === "suspended") AC.resume();
+  if (AC && AC.state !== "running" && AC.resume) AC.resume().catch(() => {});
+  if (master) master.gain.value = muted ? 0 : 0.35;
   return AC;
 }
 let noiseBuf = null;
@@ -279,6 +281,7 @@ const SFX = {
   pteroDie() { tone("square", 300, 2000, 0.3, 0.2); tone("square", 2000, 200, 0.5, 0.2, 0.3); },
   coin() { tone("square", 130, 110, 0.5, 0.3); tone("triangle", 260, 220, 0.45, 0.2); },
   extra() { [523, 659, 784, 1047, 784, 1047].forEach((f, i) => tone("square", f, f, 0.08, 0.14, i * 0.08)); },
+  crumble() { nburst(1.2, 0.3, 300, 0.6, 0, 90); tone("sawtooth", 90, 40, 1.0, 0.15); },
   bonus() { [392, 523, 659, 784].forEach((f, i) => tone("square", f, f, 0.12, 0.13, i * 0.1)); },
 };
 
@@ -287,7 +290,7 @@ let mode = "attract", modeT = 0, attractPage = 0, credits = 0, paused = false;
 let players = [], enemies = [], eggs = [], fx = [], pops = [], buzzards = [], pteros = [], hands = [];
 let wave = 1, waveType = "", waveT = 0, waveState = "intro", waveStateT = 0, spawnQueue = [], eggStreak = 0;
 let bridgeGone = false, bridgeBurn = 0, trollOn = false, nextPtero = 0, glad = false, teamBroken = false;
-let frame = 0;
+let frame = 0, pteroCount = 0, crumble = [];
 const keys = {};
 const DEFAULT_TABLE = [["WMS", 20000], ["JDN", 17500], ["BKN", 15000], ["CRB", 12500], ["MRS", 10000], ["PJR", 7500], ["KFL", 5000], ["WTP", 2500]];
 let table;
@@ -297,6 +300,7 @@ let entry = null;
 
 function waveKind(w) {
   if (w % 5 === 0) return "egg";
+  if (w >= 8 && (w - 8) % 5 === 0) return "ptero";
   const m = w % 5;
   if (m === 2) return "survival";
   if (m === 3) return players.length > 1 ? "team" : "regular";
@@ -359,7 +363,9 @@ function beginWave() {
   waveType = waveKind(wave); waveT = 0; waveState = "intro"; waveStateT = 0; teamBroken = false; glad = waveType === "gladiator";
   trollOn = wave >= 3;
   if (wave === 3 && !bridgeGone) bridgeBurn = 1;
-  nextPtero = 60 * Math.max(25, 75 - wave * 4);
+  nextPtero = waveType === "ptero" ? 60 * 3 : 60 * Math.max(25, 75 - wave * 4);
+  pteroCount = waveType === "ptero" ? 3 : 0;
+  crumble = LEDGES.filter(l => !l.bridge && wave > 1 && ledgeActive(l, wave - 1) && !ledgeActive(l, wave)).map(l => ({ l, t: 0 }));
   for (const p of players) { p.diedThisWave = false; if (p.lives > 0 && p.state !== "spawn" && p.state !== "alive") { p.lives--; spawnPlayer(p); } }
   if (waveType === "egg") {
     const spots = [];
@@ -374,10 +380,10 @@ function beginWave() {
   }
 }
 function waveTitle() {
-  return { survival: "SURVIVAL WAVE", egg: "EGG WAVE", team: "TEAM WAVE", gladiator: "GLADIATOR WAVE", regular: "" }[waveType];
+  return { ptero: "PTERODACTYL WAVE", survival: "SURVIVAL WAVE", egg: "EGG WAVE", team: "TEAM WAVE", gladiator: "GLADIATOR WAVE", regular: "" }[waveType];
 }
 function waveSub() {
-  return { survival: "3000 FOR NOT DYING", egg: "COLLECT THE EGGS", team: "3000 FOR TEAMWORK", gladiator: "3000 FOR FIRST UNSEATING", regular: "" }[waveType];
+  return { ptero: "BEWARE OF THE PTERODACTYLS", survival: "3000 FOR NOT DYING", egg: "COLLECT THE EGGS", team: "3000 FOR TEAMWORK", gladiator: "3000 FOR FIRST UNSEATING", regular: "" }[waveType];
 }
 function endWave() {
   waveState = "bonus"; waveStateT = 0;
@@ -393,9 +399,12 @@ function gameOver() {
 }
 function afterGameOver() {
   const best = players.map(p => p.score).filter(s => s > table[table.length - 1][1]);
-  if (best.length) { entry = { pi: players.findIndex(p => p.score === Math.max(...best)), letters: [0, 0, 0], pos: 0 }; mode = "entry"; modeT = 0; }
+  if (best.length) { entry = { pi: players.findIndex(p => p.score === Math.max(...best)), letters: [0, 0, 0], pos: 0 }; mode = "entry"; modeT = 0; flapQueue = [0, 0]; /* build 31: no stale flap may skip initial 1 */ }
   else { mode = "attract"; modeT = 0; attractPage = 1; }
 }
+function entryArmed() { return mode === "entry" && entry && modeT >= 30; } /* 0.5 s guard */
+function entryNext() { if (!entryArmed()) return; SFX.egg(); if (entry.pos < 2) entry.pos++; else finishEntry(); }
+function entryShift(d) { if (entryArmed()) entry.letters[entry.pos] = (entry.letters[entry.pos] + d + 26) % 26; }
 function finishEntry() {
   const name = entry.letters.map(i => "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i]).join("");
   table.push([name, players[entry.pi].score]); table.sort((a, b) => b[1] - a[1]); table = table.slice(0, 8);
@@ -457,6 +466,8 @@ function update() {
   if (mode === "entry") return;
   if (paused) return;
   waveStateT++;
+  for (const c of crumble) c.t++;
+  if (waveStateT === 1 && crumble.length) SFX.crumble();
   if (bridgeBurn > 0) { bridgeBurn++; if (bridgeBurn > 120) { bridgeBurn = 0; bridgeGone = true; } }
   if (waveState === "intro" && waveStateT > 150) { waveState = "play"; waveStateT = 0; }
   if (waveState === "bonus") { if (waveStateT > 150) { wave++; beginWave(); } }
@@ -599,7 +610,7 @@ function updateBuzzards() {
 }
 function updatePtero() {
   if (waveState === "play" && waveT > nextPtero && enemies.length) {
-    nextPtero = waveT + 60 * 30;
+    nextPtero = waveT + (pteroCount > 1 ? 60 * 2 : 60 * 30); if (pteroCount > 0) pteroCount--;
     const side = Math.random() < 0.5 ? -1 : 1;
     pteros.push({ x: side < 0 ? -20 : W + 20, y: 40 + Math.random() * 100, vx: -side * 2.4, vy: 0, t: 0 });
     SFX.ptero();
@@ -765,6 +776,14 @@ function drawPlayfield() {
     if (!ledgeActive(l, wave)) continue;
     drawLedge(l);
   }
+  for (const c of crumble) {
+    if (c.t > 150) continue;
+    ctx.save(); ctx.globalAlpha = Math.max(0, 1 - c.t / 150);
+    const l = c.l;
+    for (let x = l.x0; x < l.x1; x += 2) { const h = hash(x * 7 + l.y), fall = Math.max(0, c.t - h * 60) ** 1.6 * 0.05;
+      ctx.fillStyle = h < 0.5 ? "#d06818" : "#a04a08"; ctx.fillRect(x, l.y + fall, 2, 2 + ((h * 5) | 0)); }
+    ctx.restore();
+  }
   if (!baseCache) baseCache = buildBase();
   const lavaTop = (wave === 1 && waveState === "intro") ? H : (wave === 1 && waveT < 120) ? H - (H - LAVA_Y) * waveT / 120 : LAVA_Y;
   ctx.fillStyle = "#ff2600"; ctx.fillRect(0, lavaTop, W, H - lavaTop);
@@ -898,7 +917,7 @@ function flapPress(pi) {
   audio();
   if (mode === "attract") return coin();
   if (mode === "credit") return start(1);
-  if (mode === "entry") { if (entry.pos < 2) entry.pos++; else finishEntry(); return; }
+  if (mode === "entry") { entryNext(); return; }
   if (mode === "play" && !paused) flapQueue[pi] = 1;
 }
 function updateInputs() {
@@ -912,10 +931,11 @@ addEventListener("keydown", e => {
   if (e.repeat) return;
   keys[e.code] = true;
   if (mode === "entry" && (e.code === "ArrowLeft" || e.code === "ArrowRight" || e.code === "KeyA" || e.code === "KeyD")) {
-    const d = e.code === "ArrowRight" || e.code === "KeyD" ? 1 : -1; entry.letters[entry.pos] = (entry.letters[entry.pos] + d + 26) % 26; return;
+    entryShift(e.code === "ArrowRight" || e.code === "KeyD" ? 1 : -1); return;
   }
+  if (mode === "entry" && /^Key[A-Z]$/.test(e.code)) { if (entryArmed()) { entry.letters[entry.pos] = e.code.charCodeAt(3) - 65; entryNext(); } return; }
   if (e.code === "Digit5" || e.code === "Numpad5") return coin();
-  if (e.code === "Enter" || e.code === "NumpadEnter") { if (mode === "entry") return finishEntry(); return credits ? start(1) : coin(); }
+  if (e.code === "Enter" || e.code === "NumpadEnter") { if (mode === "entry") return entryNext(); return credits ? start(1) : coin(); }
   if (e.code === "Digit1") return start(1);
   if (e.code === "Digit2") return start(2);
   if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW" || e.code === "ControlLeft" || e.code === "ControlRight") return flapPress(0);
@@ -932,14 +952,14 @@ let touchDir = 0; const heldDirs = new Map();
 function recomputeTouchDir() { let d = 0; for (const v of heldDirs.values()) d = v; touchDir = d; document.querySelectorAll(".tbtn").forEach(b => b.classList.toggle("active", [...heldDirs.values()].includes(+b.dataset.dir))); }
 document.querySelectorAll(".tbtn").forEach(btn => {
   btn.addEventListener("pointerdown", e => { e.preventDefault(); e.stopPropagation(); audio(); try { btn.setPointerCapture(e.pointerId); } catch (_) {} heldDirs.set(e.pointerId, +btn.dataset.dir); recomputeTouchDir();
-    if (mode === "entry") entry.letters[entry.pos] = (entry.letters[entry.pos] + +btn.dataset.dir + 26) % 26; });
+    if (mode === "entry") entryShift(+btn.dataset.dir); });
   const up = e => { heldDirs.delete(e.pointerId); recomputeTouchDir(); };
   btn.addEventListener("pointerup", up); btn.addEventListener("pointercancel", up); btn.addEventListener("lostpointercapture", up);
   btn.addEventListener("contextmenu", e => e.preventDefault());
 });
 document.addEventListener("pointerdown", e => {
   if (e.pointerType === "touch" && !touchMode) { touchMode = true; document.body.classList.add("touch"); }
-  if (e.target.closest("#topbar") || e.target.closest(".tbtn")) return;
+  if (e.target.closest("#topbar") || e.target.closest(".tbtn") || e.target.closest("#btn-flap")) return;
   if (e.pointerType === "mouse" && e.target !== cv) return;
   e.preventDefault();
   flapPress(0);
@@ -949,9 +969,12 @@ if ("ontouchstart" in window || navigator.maxTouchPoints > 0) { touchMode = true
 document.addEventListener("touchstart", e => { if (!e.target.closest("#topbar")) e.preventDefault(); }, { passive: false });
 document.addEventListener("contextmenu", e => e.preventDefault());
 
+const flapBtn = document.getElementById("btn-flap");
+if (flapBtn) { flapBtn.addEventListener("pointerdown", e => { e.preventDefault(); e.stopPropagation(); audio(); flapBtn.classList.add("active"); flapPress(0); });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(t => flapBtn.addEventListener(t, () => flapBtn.classList.remove("active"))); }
 const muteBtn = document.getElementById("btn-mute");
 function toggleMute() {
-  muted = !muted; localStorage.setItem("joust_mute", muted ? "1" : "0");
+  muted = !muted; localStorage.setItem("joust_mute_v31", muted ? "1" : "0");
   if (master) master.gain.value = muted ? 0 : 0.35;
   muteBtn.textContent = muted ? "SOUND OFF" : "SOUND ON";
 }
@@ -971,7 +994,8 @@ requestAnimationFrame(loop);
 
 // test/debug hook (read-mostly)
 window.JOUST = {
-  get state() { return { mode, wave, waveType, waveState, credits, enemies: enemies.length, eggs: eggs.length, pteros: pteros.length, bridgeGone, trollOn,
+  build: 31, audio: () => (AC ? AC.state : "none"), entry: () => entry && { pos: entry.pos, letters: entry.letters.map(i => String.fromCharCode(65 + i)).join(""), t: modeT }, table: () => table.map(r => r.join(":")),
+  get state() { return { mode, wave, crumbling: crumble.length, waveType, waveState, credits, enemies: enemies.length, eggs: eggs.length, pteros: pteros.length, bridgeGone, trollOn,
     players: players.map(p => ({ state: p.state, score: p.score, lives: p.lives, x: p.x, y: p.y })), ledges: activeLedges().map(l => l.id) }; },
   debug: DEBUG ? {
     skipIntro() { waveState = "play"; waveStateT = 0; for (const p of players) if (p.state === "spawn") { p.mat = 1; p.state = "alive"; } },
@@ -981,6 +1005,40 @@ window.JOUST = {
     ptero() { nextPtero = 0; waveT = 1; },
     trollGrab() { const e = enemies.find(e => e.state === "alive") || spawnEnemy("H"); Object.assign(e, { state: "alive", x: 22, y: 214, vx: 0, vy: 0, ground: null, thinkT: 999, targetY: 230, grabbed: { t: 0 }, escapes: -99 }); hands.push({ r: e, t: 0 }); SFX.troll(); },
     nextWave() { wave++; beginWave(); },
+    gotoWave(n) { wave = n; beginWave(); },
+    setScore(n) { players[0].score = n; },
+    endGame() { for (const p of players) { p.lives = 0; p.state = "out"; } gameOver(); },
   } : null,
 };
+  // -- Audio unlock (sound ON by default): first tap/click/key anywhere resumes Web Audio --
+  (function () {
+    function silentWav() {
+      const n = 800, b = new Uint8Array(44 + n), v = new DataView(b.buffer);
+      const s = (o, t) => { for (let i = 0; i < t.length; i++) b[o + i] = t.charCodeAt(i); };
+      s(0, "RIFF"); v.setUint32(4, 36 + n, true); s(8, "WAVEfmt "); v.setUint32(16, 16, true);
+      v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 8000, true); v.setUint32(28, 8000, true);
+      v.setUint16(32, 1, true); v.setUint16(34, 8, true); s(36, "data"); v.setUint32(40, n, true); b.fill(128, 44);
+      let str = ""; for (let i = 0; i < b.length; i++) str += String.fromCharCode(b[i]);
+      return "data:audio/wav;base64," + btoa(str);
+    }
+    let tag = null, kicked = null;
+    function onGesture() {
+      try { if (navigator.audioSession && navigator.audioSession.type !== "playback") navigator.audioSession.type = "playback"; } catch (_) {}
+      try { if (!tag) { tag = new Audio(silentWav()); tag.setAttribute("playsinline", ""); tag.loop = true; tag.volume = 0.01; } if (tag.paused) { const p = tag.play(); if (p && p.catch) p.catch(function () {}); } } catch (_) {}
+      try { audio(); } catch (_) {}
+      try {
+        const c = AC;
+        if (c) {
+          if (c.state !== "running" && c.resume) c.resume().catch(function () {});
+          if (kicked !== c) { kicked = c; const sb = c.createBuffer(1, 1, 22050), src = c.createBufferSource(); src.buffer = sb; src.connect(c.destination); src.start(0); }
+        }
+      } catch (_) {}
+    }
+    ["pointerdown", "touchstart", "touchend", "mousedown", "click", "keydown"].forEach(function (t) {
+      window.addEventListener(t, onGesture, { capture: true, passive: true });
+    });
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) { try { const c = AC; if (c && c.state === "suspended") c.resume().catch(function () {}); } catch (_) {} } });
+    window.__audioInfo = function () { const c = AC; return { ctx: c ? c.state : "none", muted: muted }; };
+  })();
+
 })();
