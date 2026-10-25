@@ -354,6 +354,7 @@ function addScore(p, pts, x, y) {
 
 /* ---------------- game flow ---------------- */
 function startGame(nPlayers, startWave = 1) {
+  if (window.WTPShare) WTPShare.hide();
   players = []; for (let i = 0; i < nPlayers; i++) players.push(newPlayer(i));
   mode = "play"; wave = startWave; bridgeGone = startWave >= 3; bridgeBurn = 0;
   beginWave();
@@ -395,7 +396,7 @@ function endWave() {
   }
 }
 function gameOver() {
-  mode = "over"; modeT = 0;
+  mode = "over"; modeT = 0; if (window.WTPShare) WTPShare.show(Math.max(...players.map(p => p.score)));
 }
 function afterGameOver() {
   const best = players.map(p => p.score).filter(s => s > table[table.length - 1][1]);
